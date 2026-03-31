@@ -1571,72 +1571,77 @@ void AArch64InstPrinter::printPrefetchOp(const MCInst *MI, unsigned OpNum,
   markup(O, Markup::Immediate) << '#' << formatImm(prfop);
 }
 
+unsigned AArch64InstPrinter::decodeIdentityHint(unsigned Value) {
+  return Value;
+}
+
+unsigned AArch64InstPrinter::decodeBTIHint(unsigned Value) {
+  return Value ^ 32;
+}
+
+unsigned AArch64InstPrinter::decodeSHUHint(unsigned Value) {
+  return Value - 50;
+}
+
+unsigned AArch64InstPrinter::decodeTSBHint(unsigned Value) {
+  return Value ^ 16;
+}
+
+template <typename LookupFn, typename DecodeFn>
+void AArch64InstPrinter::printNamedHintOp(unsigned Encoded, raw_ostream &O,
+                                          LookupFn LookupByEncoding,
+                                          DecodeFn DecodeValue) {
+  unsigned Decoded = DecodeValue(Encoded);
+  if (auto Hint = LookupByEncoding(Decoded))
+    O << Hint->Name;
+  else
+    markup(O, Markup::Immediate) << '#' << formatImm(Decoded);
+}
+
 void AArch64InstPrinter::printPSBHintOp(const MCInst *MI, unsigned OpNum,
                                         const MCSubtargetInfo &STI,
                                         raw_ostream &O) {
-  unsigned psbhintop = MI->getOperand(OpNum).getImm();
-  auto PSB = AArch64PSBHint::lookupPSBByEncoding(psbhintop);
-  if (PSB)
-    O << PSB->Name;
-  else
-    markup(O, Markup::Immediate) << '#' << formatImm(psbhintop);
+  printNamedHintOp(MI->getOperand(OpNum).getImm(), O,
+                   AArch64PSBHint::lookupPSBByEncoding, decodeIdentityHint);
 }
 
 void AArch64InstPrinter::printBTIHintOp(const MCInst *MI, unsigned OpNum,
                                         const MCSubtargetInfo &STI,
                                         raw_ostream &O) {
-  unsigned btihintop = MI->getOperand(OpNum).getImm() ^ 32;
-  auto BTI = AArch64BTIHint::lookupBTIByEncoding(btihintop);
-  if (BTI)
-    O << BTI->Name;
-  else
-    markup(O, Markup::Immediate) << '#' << formatImm(btihintop);
+  printNamedHintOp(MI->getOperand(OpNum).getImm(), O,
+                   AArch64BTIHint::lookupBTIByEncoding, decodeBTIHint);
 }
 
 void AArch64InstPrinter::printSHUHintOp(const MCInst *MI, unsigned OpNum,
                                         const MCSubtargetInfo &STI,
                                         raw_ostream &O) {
-  unsigned shuhintop = MI->getOperand(OpNum).getImm() - 50;
-  auto SHU = AArch64CMHPriorityHint::lookupCMHPriorityHintByEncoding(shuhintop);
-  if (SHU)
-    O << SHU->Name;
-  else
-    markup(O, Markup::Immediate) << '#' << formatImm(shuhintop);
+  printNamedHintOp(MI->getOperand(OpNum).getImm(), O,
+                   AArch64CMHPriorityHint::lookupCMHPriorityHintByEncoding,
+                   decodeSHUHint);
 }
 
 void AArch64InstPrinter::printTSBHintOp(const MCInst *MI, unsigned OpNum,
                                         const MCSubtargetInfo &STI,
                                         raw_ostream &O) {
-  unsigned tsbhintop = MI->getOperand(OpNum).getImm() ^ 16;
-  auto TSB = AArch64TSB::lookupTSBByEncoding(tsbhintop);
-  if (TSB)
-    O << TSB->Name;
-  else
-    markup(O, Markup::Immediate) << '#' << formatImm(tsbhintop);
+  printNamedHintOp(MI->getOperand(OpNum).getImm(), O,
+                   AArch64TSB::lookupTSBByEncoding, decodeTSBHint);
 }
 
 void AArch64InstPrinter::printCMHPriorityHintOp(const MCInst *MI,
                                                 unsigned OpNum,
                                                 const MCSubtargetInfo &STI,
                                                 raw_ostream &O) {
-  unsigned priorityhint_op = MI->getOperand(OpNum).getImm();
-  auto PHint =
-      AArch64CMHPriorityHint::lookupCMHPriorityHintByEncoding(priorityhint_op);
-  if (PHint)
-    O << PHint->Name;
-  else
-    markup(O, Markup::Immediate) << '#' << formatImm(priorityhint_op);
+  printNamedHintOp(MI->getOperand(OpNum).getImm(), O,
+                   AArch64CMHPriorityHint::lookupCMHPriorityHintByEncoding,
+                   decodeIdentityHint);
 }
 
 void AArch64InstPrinter::printTIndexHintOp(const MCInst *MI, unsigned OpNum,
                                            const MCSubtargetInfo &STI,
                                            raw_ostream &O) {
-  unsigned tindexhintop = MI->getOperand(OpNum).getImm();
-  auto TIndex = AArch64TIndexHint::lookupTIndexByEncoding(tindexhintop);
-  if (TIndex)
-    O << TIndex->Name;
-  else
-    markup(O, Markup::Immediate) << '#' << formatImm(tindexhintop);
+  printNamedHintOp(MI->getOperand(OpNum).getImm(), O,
+                   AArch64TIndexHint::lookupTIndexByEncoding,
+                   decodeIdentityHint);
 }
 
 void AArch64InstPrinter::printFPImmOperand(const MCInst *MI, unsigned OpNum,
@@ -2283,10 +2288,6 @@ void AArch64InstPrinter::printSyspXzrPair(const MCInst *MI, unsigned OpNum,
 void AArch64InstPrinter::printPHintOp(const MCInst *MI, unsigned OpNum,
                                       const MCSubtargetInfo &STI,
                                       raw_ostream &O) {
-  unsigned Op = MI->getOperand(OpNum).getImm();
-  auto PH = AArch64PHint::lookupPHintByEncoding(Op);
-  if (PH)
-    O << PH->Name;
-  else
-    markup(O, Markup::Immediate) << '#' << formatImm(Op);
+  printNamedHintOp(MI->getOperand(OpNum).getImm(), O,
+                   AArch64PHint::lookupPHintByEncoding, decodeIdentityHint);
 }
