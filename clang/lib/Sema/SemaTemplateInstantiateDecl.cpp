@@ -49,11 +49,11 @@ static bool isDeclWithinFunction(const Decl *D) {
   return false;
 }
 
-template<typename DeclT>
-static bool SubstQualifier(Sema &SemaRef, const DeclT *OldDecl, DeclT *NewDecl,
+template <typename DeclT>
+static void SubstQualifier(Sema &SemaRef, const DeclT *OldDecl, DeclT *NewDecl,
                            const MultiLevelTemplateArgumentList &TemplateArgs) {
   if (!OldDecl->getQualifierLoc())
-    return false;
+    return;
 
   assert((NewDecl->getFriendObjectKind() ||
           !OldDecl->getLexicalDeclContext()->isDependentContext()) &&
@@ -67,22 +67,19 @@ static bool SubstQualifier(Sema &SemaRef, const DeclT *OldDecl, DeclT *NewDecl,
   NestedNameSpecifierLoc NewQualifierLoc
       = SemaRef.SubstNestedNameSpecifierLoc(OldDecl->getQualifierLoc(),
                                             TemplateArgs);
-
-  if (!NewQualifierLoc)
-    return true;
-
+  assert(NewQualifierLoc &&
+         "substitution for the declaration qualifiers should never fail");
   NewDecl->setQualifierInfo(NewQualifierLoc);
-  return false;
 }
 
-bool TemplateDeclInstantiator::SubstQualifier(const DeclaratorDecl *OldDecl,
+void TemplateDeclInstantiator::SubstQualifier(const DeclaratorDecl *OldDecl,
                                               DeclaratorDecl *NewDecl) {
-  return ::SubstQualifier(SemaRef, OldDecl, NewDecl, TemplateArgs);
+  ::SubstQualifier(SemaRef, OldDecl, NewDecl, TemplateArgs);
 }
 
-bool TemplateDeclInstantiator::SubstQualifier(const TagDecl *OldDecl,
+void TemplateDeclInstantiator::SubstQualifier(const TagDecl *OldDecl,
                                               TagDecl *NewDecl) {
-  return ::SubstQualifier(SemaRef, OldDecl, NewDecl, TemplateArgs);
+  ::SubstQualifier(SemaRef, OldDecl, NewDecl, TemplateArgs);
 }
 
 // Include attribute instantiation code.
@@ -1800,8 +1797,7 @@ Decl *TemplateDeclInstantiator::VisitVarDecl(VarDecl *D,
     SemaRef.deduceOpenCLAddressSpace(Var);
 
   // Substitute the nested name specifier, if any.
-  if (SubstQualifier(D, Var))
-    return nullptr;
+  SubstQualifier(D, Var);
 
   SemaRef.BuildVariableInstantiation(Var, D, TemplateArgs, LateAttrs, Owner,
                                      StartingScope, InstantiatingVarTemplate);
@@ -2186,7 +2182,7 @@ Decl *TemplateDeclInstantiator::VisitEnumDecl(EnumDecl *D) {
   // If it did, mark the new tag as being associated with that typedef.
   if (TypedefNameDecl *TND = SemaRef.Context.getTypedefNameForUnnamedTagDecl(D))
     SemaRef.Context.addTypedefNameForUnnamedTagDecl(Enum, TND);
-  if (SubstQualifier(D, Enum)) return nullptr;
+  SubstQualifier(D, Enum);
   Owner->addDecl(Enum);
 
   EnumDecl *Def = D->getDefinition();
@@ -2632,8 +2628,7 @@ Decl *TemplateDeclInstantiator::VisitCXXRecordDecl(CXXRecordDecl *D) {
   Record->setImplicit(D->isImplicit());
 
   // Substitute the nested name specifier, if any.
-  if (SubstQualifier(D, Record))
-    return nullptr;
+  SubstQualifier(D, Record);
 
   SemaRef.InstantiateAttrsForDecl(TemplateArgs, D, Record, LateAttrs,
                                                               StartingScope);
@@ -4599,8 +4594,7 @@ TemplateDeclInstantiator::VisitClassTemplateSpecializationDecl(
     InstClassTemplate->AddSpecialization(InstD, InsertPos);
 
   // Substitute the nested name specifier, if any.
-  if (SubstQualifier(D, InstD))
-    return nullptr;
+  SubstQualifier(D, InstD);
 
   InstD->setAccess(D->getAccess());
   InstD->setInstantiationOfMemberClass(D, TSK_ImplicitInstantiation);
@@ -4711,8 +4705,7 @@ TemplateDeclInstantiator::VisitVarTemplateSpecializationDecl(
     SemaRef.deduceOpenCLAddressSpace(Var);
 
   // Substitute the nested name specifier, if any.
-  if (SubstQualifier(D, Var))
-    return nullptr;
+  SubstQualifier(D, Var);
 
   SemaRef.BuildVariableInstantiation(Var, D, TemplateArgs, LateAttrs, Owner,
                                      StartingScope, false, PrevDecl);
@@ -4928,14 +4921,19 @@ TemplateDeclInstantiator::InstantiateClassTemplatePartialSpecialization(
   // Check these arguments are valid for a template partial specialization.
   if (SemaRef.CheckTemplatePartialSpecializationArgs(
           PartialSpec->getLocation(), ClassTemplate, InstTemplateArgs.size(),
-          CTAI.CanonicalConverted))
+          CTAI.SugaredConverted))
     return nullptr;
+
+  SmallVector<TemplateArgument, 4> FunctionallyEquivalentConverted =
+      CTAI.SugaredConverted;
+  SemaRef.Context.canonicalizeTemplateArguments(
+      FunctionallyEquivalentConverted, CanonicalizationKind::Functional);
 
   // Figure out where to insert this class template partial specialization
   // in the member template's set of class template partial specializations.
   void *InsertPos = nullptr;
   ClassTemplateSpecializationDecl *PrevDecl =
-      ClassTemplate->findPartialSpecialization(CTAI.CanonicalConverted,
+      ClassTemplate->findPartialSpecialization(FunctionallyEquivalentConverted,
                                                InstParams, InsertPos);
 
   // Create the class template partial specialization declaration.
@@ -4943,15 +4941,13 @@ TemplateDeclInstantiator::InstantiateClassTemplatePartialSpecialization(
       ClassTemplatePartialSpecializationDecl::Create(
           SemaRef.Context, PartialSpec->getTagKind(), Owner,
           PartialSpec->getBeginLoc(), PartialSpec->getLocation(), InstParams,
-          ClassTemplate, CTAI.CanonicalConverted,
-          /*CanonInjectedTST=*/CanQualType(),
+          ClassTemplate, FunctionallyEquivalentConverted,
           /*PrevDecl=*/nullptr);
 
   InstPartialSpec->setTemplateArgsAsWritten(InstTemplateArgs);
 
   // Substitute the nested name specifier, if any.
-  if (SubstQualifier(PartialSpec, InstPartialSpec))
-    return nullptr;
+  SubstQualifier(PartialSpec, InstPartialSpec);
 
   InstPartialSpec->setInstantiatedFromMember(PartialSpec);
 
@@ -5037,14 +5033,19 @@ TemplateDeclInstantiator::InstantiateVarTemplatePartialSpecialization(
   // Check these arguments are valid for a template partial specialization.
   if (SemaRef.CheckTemplatePartialSpecializationArgs(
           PartialSpec->getLocation(), VarTemplate, InstTemplateArgs.size(),
-          CTAI.CanonicalConverted))
+          CTAI.SugaredConverted))
     return nullptr;
+
+  SmallVector<TemplateArgument, 4> FunctionallyEquivalentConverted =
+      CTAI.SugaredConverted;
+  SemaRef.Context.canonicalizeTemplateArguments(
+      FunctionallyEquivalentConverted, CanonicalizationKind::Functional);
 
   // Figure out where to insert this variable template partial specialization
   // in the member template's set of variable template partial specializations.
   void *InsertPos = nullptr;
   VarTemplateSpecializationDecl *PrevDecl =
-      VarTemplate->findPartialSpecialization(CTAI.CanonicalConverted,
+      VarTemplate->findPartialSpecialization(FunctionallyEquivalentConverted,
                                              InstParams, InsertPos);
 
   // Do substitution on the type of the declaration
@@ -5066,13 +5067,12 @@ TemplateDeclInstantiator::InstantiateVarTemplatePartialSpecialization(
       VarTemplatePartialSpecializationDecl::Create(
           SemaRef.Context, Owner, PartialSpec->getInnerLocStart(),
           PartialSpec->getLocation(), InstParams, VarTemplate, TSI->getType(),
-          TSI, PartialSpec->getStorageClass(), CTAI.CanonicalConverted);
+          TSI, PartialSpec->getStorageClass(), FunctionallyEquivalentConverted);
 
   InstPartialSpec->setTemplateArgsAsWritten(InstTemplateArgs);
 
   // Substitute the nested name specifier, if any.
-  if (SubstQualifier(PartialSpec, InstPartialSpec))
-    return nullptr;
+  SubstQualifier(PartialSpec, InstPartialSpec);
 
   InstPartialSpec->setInstantiatedFromMember(PartialSpec);
 
@@ -5933,12 +5933,6 @@ void Sema::InstantiateFunctionDefinition(SourceLocation PointOfInstantiation,
     }
     MultiLevelTemplateArgumentList TemplateArgs = getTemplateInstantiationArgs(
         Function, DC, /*Final=*/false, Innermost, false, PatternDecl);
-
-    // Substitute into the qualifier; we can get a substitution failure here
-    // through evil use of alias templates.
-    // FIXME: Is CurContext correct for this? Should we go to the (instantiation
-    // of the) lexical context of the pattern?
-    SubstQualifier(*this, PatternDecl, Function, TemplateArgs);
 
     ActOnStartOfFunctionDef(nullptr, Function);
 

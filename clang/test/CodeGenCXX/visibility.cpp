@@ -1560,3 +1560,16 @@ namespace no_pragma_test {
   // CHECK-LABEL: define void @_ZN14no_pragma_test1SC2Ev(
   // CHECK-HIDDEN-LABEL: define hidden void @_ZN14no_pragma_test1SC2Ev(
 }
+
+namespace SpecOutOfLine1 {
+  template <class> struct A {
+    A<void> f();
+  };
+  template <>
+  struct DEFAULT A<void> {
+    ~A();
+  };
+  A<void>::~A() {}
+  // CHECK-LABEL: define void @_ZN14SpecOutOfLine11AIvED1Ev(
+  // CHECK-HIDDEN-LABEL: define void @_ZN14SpecOutOfLine11AIvED1Ev(
+} // namespace SpecOutOfLine1
