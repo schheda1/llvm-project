@@ -43,7 +43,8 @@ void AMDGPUOpenMPToolChain::addClangTargetOptions(
                           true))
     return;
 
-  for (auto BCFile : getDeviceLibs(DriverArgs, DeviceOffloadingKind)) {
+  for (auto BCFile :
+       getDeviceLibs(DriverArgs, BoundArch, DeviceOffloadingKind)) {
     CC1Args.push_back(BCFile.ShouldInternalize ? "-mlink-builtin-bitcode"
                                                : "-mlink-bitcode-file");
     CC1Args.push_back(DriverArgs.MakeArgString(BCFile.Path));
@@ -126,17 +127,15 @@ AMDGPUOpenMPToolChain::computeMSVCVersion(const Driver *D,
 
 llvm::SmallVector<ToolChain::BitCodeLibraryInfo, 12>
 AMDGPUOpenMPToolChain::getDeviceLibs(
-    const llvm::opt::ArgList &Args,
+    const llvm::opt::ArgList &Args, llvm::StringRef BoundArch,
     const Action::OffloadKind DeviceOffloadingKind) const {
   if (!Args.hasFlag(options::OPT_offloadlib, options::OPT_no_offloadlib, true))
     return {};
 
-  StringRef GpuArch = getProcessorFromTargetID(
-      getTriple(), Args.getLastArgValue(options::OPT_march_EQ));
-
+  StringRef GpuArch = getProcessorFromTargetID(getTriple(), BoundArch);
   SmallVector<BitCodeLibraryInfo, 12> BCLibs;
   for (auto BCLib :
-       getCommonDeviceLibNames(Args, GpuArch.str(), DeviceOffloadingKind))
+       getCommonDeviceLibNames(Args, GpuArch, DeviceOffloadingKind))
     BCLibs.emplace_back(BCLib);
 
   return BCLibs;

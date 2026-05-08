@@ -982,9 +982,14 @@ void ROCMToolChain::addClangTargetOptions(
   if (TT.getEnvironment() == llvm::Triple::LLVM)
     return;
 
-  // Get the device name and canonicalize it
-  const StringRef GpuArch = getGPUArch(DriverArgs);
-  auto Kind = llvm::AMDGPU::parseArchAMDGCN(GpuArch);
+  // Get the device name and canonicalize it. For offload compilation,
+  // BoundArch contains the full target ID. For non-offload (OpenCL),
+  // fall back to -mcpu.
+  StringRef GpuArch = BoundArch.empty() ? getGPUArch(DriverArgs) : BoundArch;
+
+  // Extract processor name for canonical arch lookup
+  StringRef Processor = getProcessorFromTargetID(getTriple(), GpuArch);
+  auto Kind = llvm::AMDGPU::parseArchAMDGCN(Processor);
   const StringRef CanonArch = llvm::AMDGPU::getArchNameAMDGCN(Kind);
   StringRef LibDeviceFile = RocmInstallation->getLibDeviceFile(CanonArch);
   auto ABIVer = DeviceLibABIVersion::fromCodeObjectVersion(
