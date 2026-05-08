@@ -48,29 +48,23 @@ private:
 
 static void printIR(Operation *op, bool printModuleScope, raw_ostream &out,
                     OpPrintingFlags flags) {
+  // Otherwise, check to see if we are not printing at module scope.
+  if (!printModuleScope)
+    return op->print(out << " //----- //\n",
+                     op->getBlock() ? flags.useLocalScope() : flags);
+
+  // Otherwise, we are printing at module scope.
+  out << " ('" << op->getName() << "' operation";
+  if (auto symbolName =
+          op->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName()))
+    out << ": @" << symbolName.getValue();
+  out << ") //----- //\n";
+
   // Find the top-level operation.
   auto *topLevelOp = op;
   while (auto *parentOp = topLevelOp->getParentOp())
     topLevelOp = parentOp;
   topLevelOp->print(out, flags);
-}
-
-static void printIRHeader(raw_ostream &out, StringRef title, Pass *pass,
-                          Operation *op, bool printModuleScope,
-                          bool failed = false) {
-  out << "// -----// IR Dump " << title << " " << pass->getName();
-  if (failed)
-    out << " Failed";
-  out << ": ";
-  pass->printAsTextualPipeline(out);
-  if (printModuleScope) {
-    out << " ('" << op->getName() << "' operation";
-    if (auto symbolName =
-            op->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName()))
-      out << ": @" << symbolName.getValue();
-    out << ")";
-  }
-  out << " //----- //\n";
 }
 
 /// Instrumentation hooks.
@@ -82,7 +76,8 @@ void IRPrinterInstrumentation::runBeforePass(Pass *pass, Operation *op) {
     beforePassFingerPrints.try_emplace(pass, op);
 
   config->printBeforeIfEnabled(pass, op, [&](raw_ostream &out) {
-    printIRHeader(out, "Before", pass, op, config->shouldPrintAtModuleScope());
+    out << "// -----// IR Dump Before " << pass->getName() << " ("
+        << pass->getArgument() << ")";
     printIR(op, config->shouldPrintAtModuleScope(), out,
             config->getOpPrintingFlags());
     out << "\n\n";
@@ -112,7 +107,8 @@ void IRPrinterInstrumentation::runAfterPass(Pass *pass, Operation *op) {
   }
 
   config->printAfterIfEnabled(pass, op, [&](raw_ostream &out) {
-    printIRHeader(out, "After", pass, op, config->shouldPrintAtModuleScope());
+    out << "// -----// IR Dump After " << pass->getName() << " ("
+        << pass->getArgument() << ")";
     printIR(op, config->shouldPrintAtModuleScope(), out,
             config->getOpPrintingFlags());
     out << "\n\n";
@@ -126,8 +122,8 @@ void IRPrinterInstrumentation::runAfterPassFailed(Pass *pass, Operation *op) {
     beforePassFingerPrints.erase(pass);
 
   config->printAfterIfEnabled(pass, op, [&](raw_ostream &out) {
-    printIRHeader(out, "After", pass, op, config->shouldPrintAtModuleScope(),
-                  /*failed=*/true);
+    out << formatv("// -----// IR Dump After {0} Failed ({1})", pass->getName(),
+                   pass->getArgument());
     printIR(op, config->shouldPrintAtModuleScope(), out,
             config->getOpPrintingFlags());
     out << "\n\n";
