@@ -491,7 +491,7 @@ template <class _Alloc,
                             __allocator_has_trivial_copy_construct_v<_Alloc, _In>,
                         int> = 0>
 _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 _Out*
-__uninitialized_allocator_copy_impl(_Alloc&, _In* __first1, _In* __last1, _Out* __first2) {
+__uninitialized_allocator_copy_impl(_Alloc&, const _In* __first1, const _In* __last1, _Out* __first2) {
   if (__libcpp_is_constant_evaluated()) {
     while (__first1 != __last1) {
       std::__construct_at(std::__to_address(__first2), *__first1);
