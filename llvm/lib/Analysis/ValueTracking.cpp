@@ -10406,10 +10406,23 @@ ConstantRange llvm::computeConstantRange(const Value *V, bool ForSigned,
         computeConstantRange(SI->getFalseValue(), ForSigned, SQ, Depth + 1);
     CR = CRTrue.unionWith(CRFalse);
     CR = CR.intersectWith(getRangeForSelectPattern(*SI, SQ.IIQ));
-  } else if (auto *TI = dyn_cast<TruncInst>(V)) {
-    ConstantRange SrcCR =
-        computeConstantRange(TI->getOperand(0), ForSigned, SQ, Depth + 1);
-    CR = SrcCR.truncate(BitWidth);
+  } else if (isa<SExtInst>(V) || isa<ZExtInst>(V) || isa<TruncInst>(V)) {
+    auto *CastOp = cast<CastInst>(V);
+    ConstantRange OpCR =
+        computeConstantRange(CastOp->getOperand(0), ForSigned, SQ, Depth + 1);
+    switch (CastOp->getOpcode()) {
+    case Instruction::SExt:
+      CR = OpCR.signExtend(BitWidth);
+      break;
+    case Instruction::ZExt:
+      CR = OpCR.zeroExtend(BitWidth);
+      break;
+    case Instruction::Trunc:
+      CR = OpCR.truncate(BitWidth);
+      break;
+    default:
+      llvm_unreachable("Unexpected cast opcode");
+    }
   } else if (isa<FPToUIInst>(V) || isa<FPToSIInst>(V)) {
     APInt Lower = APInt(BitWidth, 0);
     APInt Upper = APInt(BitWidth, 0);

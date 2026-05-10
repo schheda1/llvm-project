@@ -3741,6 +3741,63 @@ TEST_F(ValueTrackingTest, ComputeConstantRange) {
     // If we don't know the value of x.2, we don't know the value of x.1.
     EXPECT_TRUE(CR1.isFullSet());
   }
+
+  // zext of a value with a known range propagates as a non-negative range in
+  // the wider type.
+  {
+    auto M = parseModule(R"(
+  define i16 @test(i8 %a) {
+    %m = and i8 %a, 7
+    %z = zext i8 %m to i16
+    ret i16 %z
+  })");
+    Function *F = M->getFunction("test");
+    AssumptionCache AC(*F);
+    SimplifyQuery SQ(M->getDataLayout(), /*DT=*/nullptr, &AC);
+    Value *Z = &findInstructionByName(F, "z");
+
+    ConstantRange CR = computeConstantRange(Z, /*ForSigned=*/false, SQ);
+    EXPECT_EQ(APInt(16, 0), CR.getLower());
+    EXPECT_EQ(APInt(16, 8), CR.getUpper());
+  }
+
+  // sext of an i8 value whose range crosses the sign bit produces a sign-
+  // extended range in the wider type.
+  {
+    auto M = parseModule(R"(
+  define i16 @test(i8 %a) {
+    %o = or i8 %a, -128
+    %s = sext i8 %o to i16
+    ret i16 %s
+  })");
+    Function *F = M->getFunction("test");
+    AssumptionCache AC(*F);
+    SimplifyQuery SQ(M->getDataLayout(), /*DT=*/nullptr, &AC);
+    Value *S = &findInstructionByName(F, "s");
+
+    ConstantRange CR = computeConstantRange(S, /*ForSigned=*/true, SQ);
+    EXPECT_EQ(APInt(16, -128, /*isSigned=*/true), CR.getSignedMin());
+    EXPECT_EQ(APInt(16, -1, /*isSigned=*/true), CR.getSignedMax());
+  }
+
+  // trunc narrows the operand range. A value bounded in the source type stays
+  // bounded in the destination type when the bounds fit.
+  {
+    auto M = parseModule(R"(
+  define i8 @test(i32 %a) {
+    %m = and i32 %a, 15
+    %t = trunc i32 %m to i8
+    ret i8 %t
+  })");
+    Function *F = M->getFunction("test");
+    AssumptionCache AC(*F);
+    SimplifyQuery SQ(M->getDataLayout(), /*DT=*/nullptr, &AC);
+    Value *T = &findInstructionByName(F, "t");
+
+    ConstantRange CR = computeConstantRange(T, /*ForSigned=*/false, SQ);
+    EXPECT_EQ(APInt(8, 0), CR.getLower());
+    EXPECT_EQ(APInt(8, 16), CR.getUpper());
+  }
 }
 
 struct FindAllocaForValueTestParams {
