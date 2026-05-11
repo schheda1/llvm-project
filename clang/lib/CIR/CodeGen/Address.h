@@ -149,14 +149,17 @@ public:
 
   /// Return the underlying alloca for this address, if any.
   ///
-  /// Addresses may refer to an alloca through a cast, for example when a target
-  /// stack address space is cast to the language-visible address space. Peel
-  /// those cast ops so callers that need to annotate the original alloca can
-  /// still find it.
+  /// Addresses may refer to an alloca through an address space cast, for
+  /// example when a target stack address space is cast to the language-visible
+  /// address space. Peel those casts so callers that need to annotate the
+  /// original alloca can still find it.
   cir::AllocaOp getUnderlyingAllocaOp() const {
     mlir::Value ptr = getPointer();
-    while (auto castOp = ptr.getDefiningOp<cir::CastOp>())
+    while (cir::CastOp castOp = ptr.getDefiningOp<cir::CastOp>()) {
+      if (castOp.getKind() != cir::CastKind::address_space)
+        break;
       ptr = castOp.getSrc();
+    }
     return ptr.getDefiningOp<cir::AllocaOp>();
   }
 
