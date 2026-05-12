@@ -622,7 +622,7 @@ static inline bool addrspacesMayAlias(unsigned AS1, unsigned AS2) {
 
   // clang-format off
   static const bool ASAliasRules[][AMDGPUAS::MAX_AMDGPU_ADDRESS + 1] = {
-    /*                       Flat   Global Region  Local Constant Private Const32 BufFatPtr BufRsrc BufStrdPtr Reserved Reserved Reserved Reserved Reserved ExecSync */
+    /*                       Flat   Global Region  Local Constant Private Const32 BufFatPtr BufRsrc BufStrdPtr Reserved Reserved Reserved Reserved Reserved Barrier */
     /* Flat     */            {true,  true,  false, true,  true,  true,  true,  true,  true,  true, false, false, false, false, false, false},
     /* Global   */            {true,  true,  false, false, true,  false, true,  true,  true,  true, false, false, false, false, false, false},
     /* Region   */            {false, false, true,  false, false, false, false, false, false, false, false, false, false, false, false, false},
@@ -638,7 +638,7 @@ static inline bool addrspacesMayAlias(unsigned AS1, unsigned AS2) {
     /* Reserved  */          {false,  false,  false, false, false,  false, false,  false,  false,  false, false, false, false, false, false, false},
     /* Reserved  */          {false,  false,  false, false, false,  false, false,  false,  false,  false, false, false, false, false, false, false},
     /* Reserved  */          {false,  false,  false, false, false,  false, false,  false,  false,  false, false, false, false, false, false, false},
-    /* Barrier  */           {false,  false,  false, false, false,  false, false,  false,  false,  false, false, false, false, false, false, false},
+    /* Barrier  */           {false,  false,  false, false, false,  false, false,  false,  false,  false, false, false, false, false, false, true},
   };
   // clang-format on
   static_assert(std::size(ASAliasRules) == AMDGPUAS::MAX_AMDGPU_ADDRESS + 1);

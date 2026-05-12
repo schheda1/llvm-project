@@ -10,7 +10,6 @@
 @bar = internal addrspace(15) global [2 x target("amdgcn.named.barrier", 0)] poison
 
 ; CHECK-LABEL: kernel:
-; CHECK: s_barrier_signal m0
 ; CHECK: s_barrier_join m0
 ; CHECK: s_barrier_signal m0
 ; CHECK: s_barrier_wait 1
@@ -25,8 +24,6 @@
 ; CHECK:        .amdgpu_use __amdgpu_named_barrier.bar{{[^ ,]*}}
 ; CHECK:        .amdgpu_call helper
 ; CHECK:      .end_amdgpu_info
-
-; CHECK:      .amdgpu_lds __amdgpu_named_barrier.bar{{[^ ,]*}}, 32, 4
 
 ; ELF:      Section {
 ; ELF:        Name: .amdgpu.info
