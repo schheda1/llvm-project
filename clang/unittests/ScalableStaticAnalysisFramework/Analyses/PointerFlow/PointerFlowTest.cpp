@@ -1193,4 +1193,37 @@ TEST_F(PointerFlowTest, CXXConstructExprArrayInit) {
   ASSERT_NE(Sum, nullptr);
   EXPECT_EQ(*Sum, makeEdges(__LINE__, {{{"q", 1U}, {"arr", 1U}}}));
 }
+
+//////////////////////////////////////////////////////////////
+//          Template is ignored.                            //
+//////////////////////////////////////////////////////////////
+TEST_F(PointerFlowTest, FunctionTemplate) {
+  ASSERT_EQ(setUpTest(R"cpp(
+    template <typename T>
+    T* f(T *p) {
+      int *q = p
+      return q;
+    }
+  )cpp"),
+            true);
+
+  auto *Sum = getEntitySummary<FunctionDecl>("f");
+
+  ASSERT_EQ(Sum, nullptr);
+}
+
+TEST_F(PointerFlowTest, MethodInClassTemplate) {
+  ASSERT_EQ(setUpTest(R"cpp(
+    template <typename T>
+    struct Wrapper {
+      T *ptr;
+      void set(T *p) { ptr = p; }
+    };
+  )cpp"),
+            true);
+
+  auto *Sum = getEntitySummary<FunctionDecl>("set");
+
+  ASSERT_EQ(Sum, nullptr);
+}
 } // namespace
