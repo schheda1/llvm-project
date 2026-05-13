@@ -478,6 +478,116 @@ module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-a
     }
     llvm.return
   }
+
+  omp.declare_mapper @simple_mapper : !llvm.struct<"SimpleMapperTy", (i32)> {
+  ^bb0(%arg0: !llvm.ptr):
+    %field = llvm.getelementptr %arg0[0, 0] : (!llvm.ptr) -> !llvm.ptr, !llvm.struct<"SimpleMapperTy", (i32)>
+    %map = omp.map.info var_ptr(%field : !llvm.ptr, i32)
+        map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = "field"}
+    omp.declare_mapper.info map_entries(%map : !llvm.ptr)
+  }
+
+  // ------------------------------------------------------------------
+  // Map/motion clause with iterator modifier
+  // ------------------------------------------------------------------
+
+  llvm.func @target_update_map_iterator(%arr: !llvm.ptr) {
+    %c0 = llvm.mlir.constant(0 : i64) : i64
+    %c10 = llvm.mlir.constant(10 : i64) : i64
+    %c1 = llvm.mlir.constant(1 : i64) : i64
+
+    %it = omp.iterator(%iv: i64) = (%c0 to %c10 step %c1) {
+      %elem = llvm.getelementptr %arr[%iv] : (!llvm.ptr, i64) -> !llvm.ptr, i32
+      %map = omp.map.info var_ptr(%elem : !llvm.ptr, i32)
+          map_clauses(to) capture(ByRef) -> !llvm.ptr {name = ""}
+      omp.yield(%map : !llvm.ptr)
+    } -> !omp.iterated<!llvm.ptr>
+
+    omp.target_update map_iterated(%it : !omp.iterated<!llvm.ptr>)
+    llvm.return
+  }
+
+  llvm.func @target_enter_data_map_iterator_mixed(%arr: !llvm.ptr, %scalar: !llvm.ptr) {
+    %c0 = llvm.mlir.constant(0 : i64) : i64
+    %c10 = llvm.mlir.constant(10 : i64) : i64
+    %c1 = llvm.mlir.constant(1 : i64) : i64
+
+    %static_map = omp.map.info var_ptr(%scalar : !llvm.ptr, f64)
+        map_clauses(to) capture(ByRef) -> !llvm.ptr {name = "scalar"}
+
+    %it = omp.iterator(%iv: i64) = (%c0 to %c10 step %c1) {
+      %elem = llvm.getelementptr %arr[%iv] : (!llvm.ptr, i64) -> !llvm.ptr, i32
+      %map = omp.map.info var_ptr(%elem : !llvm.ptr, i32)
+          map_clauses(to) capture(ByRef) -> !llvm.ptr {name = ""}
+      omp.yield(%map : !llvm.ptr)
+    } -> !omp.iterated<!llvm.ptr>
+
+    omp.target_enter_data map_entries(%static_map : !llvm.ptr) map_iterated(%it : !omp.iterated<!llvm.ptr>) {}
+    llvm.return
+  }
+
+  llvm.func @target_exit_data_map_iterator(%arr: !llvm.ptr) {
+    %c0 = llvm.mlir.constant(0 : i64) : i64
+    %c5 = llvm.mlir.constant(5 : i64) : i64
+    %c1 = llvm.mlir.constant(1 : i64) : i64
+
+    %it = omp.iterator(%iv: i64) = (%c0 to %c5 step %c1) {
+      %elem = llvm.getelementptr %arr[%iv] : (!llvm.ptr, i64) -> !llvm.ptr, i32
+      %map = omp.map.info var_ptr(%elem : !llvm.ptr, i32)
+          map_clauses(from) capture(ByRef) -> !llvm.ptr {name = ""}
+      omp.yield(%map : !llvm.ptr)
+    } -> !omp.iterated<!llvm.ptr>
+
+    omp.target_exit_data map_iterated(%it : !omp.iterated<!llvm.ptr>) {}
+    llvm.return
+  }
+
+  llvm.func @target_data_map_iterator(%arr: !llvm.ptr) {
+    %c0 = llvm.mlir.constant(0 : i64) : i64
+    %c2 = llvm.mlir.constant(2 : i64) : i64
+    %c1 = llvm.mlir.constant(1 : i64) : i64
+
+    %it = omp.iterator(%iv: i64) = (%c0 to %c2 step %c1) {
+      %elem = llvm.getelementptr %arr[%iv] : (!llvm.ptr, i64) -> !llvm.ptr, i32
+      %map = omp.map.info var_ptr(%elem : !llvm.ptr, i32)
+          map_clauses(tofrom) capture(ByRef) -> !llvm.ptr {name = ""}
+      omp.yield(%map : !llvm.ptr)
+    } -> !omp.iterated<!llvm.ptr>
+
+    omp.target_data map_iterated(%it : !omp.iterated<!llvm.ptr>) {
+      omp.terminator
+    }
+    llvm.return
+  }
+
+  llvm.func @target_enter_data_map_iterator_dynamic(
+      %arr: !llvm.ptr, %lb: i64, %ub: i64, %step: i64) {
+    %it = omp.iterator(%iv: i64) = (%lb to %ub step %step) {
+      %elem = llvm.getelementptr %arr[%iv] : (!llvm.ptr, i64) -> !llvm.ptr, i32
+      %map = omp.map.info var_ptr(%elem : !llvm.ptr, i32)
+          map_clauses(to) capture(ByRef) -> !llvm.ptr {name = ""}
+      omp.yield(%map : !llvm.ptr)
+    } -> !omp.iterated<!llvm.ptr>
+
+    omp.target_enter_data map_iterated(%it : !omp.iterated<!llvm.ptr>) {}
+    llvm.return
+  }
+
+  llvm.func @target_enter_data_map_iterator_mapper(%arr: !llvm.ptr) {
+    %c0 = llvm.mlir.constant(0 : i64) : i64
+    %c2 = llvm.mlir.constant(2 : i64) : i64
+    %c1 = llvm.mlir.constant(1 : i64) : i64
+
+    %it = omp.iterator(%iv: i64) = (%c0 to %c2 step %c1) {
+      %elem = llvm.getelementptr %arr[%iv] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.struct<"SimpleMapperTy", (i32)>
+      %map = omp.map.info var_ptr(%elem : !llvm.ptr, !llvm.struct<"SimpleMapperTy", (i32)>)
+          map_clauses(to) capture(ByRef) mapper(@simple_mapper) -> !llvm.ptr {name = ""}
+      omp.yield(%map : !llvm.ptr)
+    } -> !omp.iterated<!llvm.ptr>
+
+    omp.target_enter_data map_iterated(%it : !omp.iterated<!llvm.ptr>) {}
+    llvm.return
+  }
 }
 
 // TARGET-LABEL: define void @omp_target_depend_iterator
@@ -513,3 +623,82 @@ module attributes {omp.is_target_device = false, omp.target_triples = ["amdgcn-a
 // TARGET: call void @.omp_target_task_proxy_func
 // TARGET: call void @__kmpc_omp_task_complete_if0
 // TARGET: tail call void @free(ptr %[[DEP_ARR]])
+
+// target_update lowers iterated motion entries into dynamic offload arrays.
+// TARGET-LABEL: define void @target_update_map_iterator
+// TARGET-SAME: (ptr %[[ARR:[0-9]+]])
+// TARGET-DAG: %[[BASEPTRS:[^ ]*offload_baseptrs]] = alloca ptr, i64 11
+// TARGET-DAG: %[[PTRS:[^ ]*offload_ptrs]] = alloca ptr, i64 11
+// TARGET-DAG: %[[SIZES:[^ ]*offload_sizes]] = alloca i64, i64 11
+// TARGET-DAG: %[[TYPES:[^ ]*offload_maptypes]] = alloca i64, i64 11
+// TARGET: omp_map_iterator.body:
+// TARGET: %[[ELEM:.*]] = getelementptr i32, ptr %[[ARR]], i64 %{{.*}}
+// TARGET: %[[IDX:.*]] = add i64 0, %{{.*}}
+// TARGET: %[[BP_SLOT:.*]] = getelementptr inbounds ptr, ptr %[[BASEPTRS]], i64 %[[IDX]]
+// TARGET: store ptr %[[ELEM]], ptr %[[BP_SLOT]]
+// TARGET: %[[P_SLOT:.*]] = getelementptr inbounds ptr, ptr %[[PTRS]], i64 %[[IDX]]
+// TARGET: store ptr %[[ELEM]], ptr %[[P_SLOT]]
+// TARGET: %[[SIZE_SLOT:.*]] = getelementptr inbounds i64, ptr %[[SIZES]], i64 %[[IDX]]
+// TARGET: store i64 4, ptr %[[SIZE_SLOT]]
+// TARGET: %[[TYPE_SLOT:.*]] = getelementptr inbounds i64, ptr %[[TYPES]], i64 %[[IDX]]
+// TARGET: store i64 1, ptr %[[TYPE_SLOT]]
+// TARGET: call void @__tgt_target_data_update_mapper(ptr @{{.*}}, i64 -1, i32 11, ptr %[[BASEPTRS]], ptr %[[PTRS]], ptr %[[SIZES]], ptr %[[TYPES]],
+
+// Static entries are stored first, followed by the iterator-expanded entries.
+// TARGET-LABEL: define void @target_enter_data_map_iterator_mixed
+// TARGET-SAME: (ptr %[[ARR2:[0-9]+]], ptr %[[SCALAR:[0-9]+]])
+// TARGET-DAG: %[[BASEPTRS2:[^ ]*offload_baseptrs]] = alloca ptr, i64 12
+// TARGET: %[[STATIC_BP:.*]] = getelementptr inbounds ptr, ptr %[[BASEPTRS2]], i64 0
+// TARGET: store ptr %[[SCALAR]], ptr %[[STATIC_BP]]
+// TARGET: omp_map_iterator.body:
+// TARGET: %[[ELEM2:.*]] = getelementptr i32, ptr %[[ARR2]], i64 %{{.*}}
+// TARGET: %[[IDX2:.*]] = add i64 1, %{{.*}}
+// TARGET: %[[ITER_BP:.*]] = getelementptr inbounds ptr, ptr %[[BASEPTRS2]], i64 %[[IDX2]]
+// TARGET: store ptr %[[ELEM2]], ptr %[[ITER_BP]]
+// TARGET: call void @__tgt_target_data_begin_mapper(ptr @{{.*}}, i64 -1, i32 12, ptr %[[BASEPTRS2]],
+
+// target_exit_data preserves the iterator-expanded FROM map type.
+// TARGET-LABEL: define void @target_exit_data_map_iterator
+// TARGET-SAME: (ptr %[[ARR3:[0-9]+]])
+// TARGET-DAG: %[[BASEPTRS3:[^ ]*offload_baseptrs]] = alloca ptr, i64 6
+// TARGET-DAG: %[[TYPES3:[^ ]*offload_maptypes]] = alloca i64, i64 6
+// TARGET: omp_map_iterator.body:
+// TARGET: %[[IDX3:.*]] = add i64 0, %omp_map_iterator.iv
+// TARGET: %[[TYPE_SLOT3:.*]] = getelementptr inbounds i64, ptr %[[TYPES3]], i64 %[[IDX3]]
+// TARGET: store i64 2, ptr %[[TYPE_SLOT3]]
+// TARGET: call void @__tgt_target_data_end_mapper(ptr @{{.*}}, i64 -1, i32 6, ptr %[[BASEPTRS3]],
+
+// target_data uses the same dynamic arrays for begin and end runtime calls.
+// TARGET-LABEL: define void @target_data_map_iterator
+// TARGET-SAME: (ptr %[[ARR4:[0-9]+]])
+// TARGET-DAG: %[[BASEPTRS4:[^ ]*offload_baseptrs]] = alloca ptr, i64 3
+// TARGET-DAG: %[[TYPES4:[^ ]*offload_maptypes]] = alloca i64, i64 3
+// TARGET-DAG: %[[ENDTYPES4:[^ ]*offload_maptypes_end]] = alloca i64, i64 3
+// TARGET: omp_map_iterator.body:
+// TARGET: store i64 3, ptr %{{.*}}
+// TARGET: store i64 3, ptr %{{.*}}
+// TARGET: call void @__tgt_target_data_begin_mapper(ptr @{{.*}}, i64 -1, i32 3, ptr %[[BASEPTRS4]]
+// TARGET: call void @__tgt_target_data_end_mapper(ptr @{{.*}}, i64 -1, i32 3, ptr %[[BASEPTRS4]], ptr %{{.*}}, ptr %{{.*}}, ptr %[[ENDTYPES4]]
+
+// Dynamic iterator bounds produce a runtime map count and VLA offload arrays.
+// TARGET-LABEL: define void @target_enter_data_map_iterator_dynamic
+// TARGET-SAME: (ptr %[[ARR5:[0-9]+]], i64 %[[LB:[0-9]+]], i64 %[[UB:[0-9]+]], i64 %[[STEP:[0-9]+]])
+// TARGET: %[[DIFF:.*]] = sub i64 %[[UB]], %[[LB]]
+// TARGET: %[[DIV:.*]] = sdiv i64 %[[DIFF]], %[[STEP]]
+// TARGET: %[[TRIPS:.*]] = add i64 %[[DIV]], 1
+// TARGET: %[[SCALED:.*]] = mul i64 1, %[[TRIPS]]
+// TARGET: %[[TOTAL:.*]] = add i64 0, %[[SCALED]]
+// TARGET-DAG: %[[BASEPTRS5:[^ ]*offload_baseptrs]] = alloca ptr, i64 %[[TOTAL]]
+// TARGET-DAG: %[[PTRS5:[^ ]*offload_ptrs]] = alloca ptr, i64 %[[TOTAL]]
+// TARGET: omp_map_iterator.body:
+// TARGET: getelementptr i32, ptr %[[ARR5]], i64 %{{.*}}
+// TARGET: %[[NPTRS:.*]] = trunc i64 %[[TOTAL]] to i32
+// TARGET: call void @__tgt_target_data_begin_mapper(ptr @{{.*}}, i64 -1, i32 %[[NPTRS]], ptr %[[BASEPTRS5]], ptr %[[PTRS5]],
+
+// Iterated entries preserve explicit mapper IDs in the mapper array.
+// TARGET-LABEL: define void @target_enter_data_map_iterator_mapper
+// TARGET-DAG: %[[MAPPERS6:[^ ]*offload_mappers]] = alloca ptr, i64 3
+// TARGET: omp_map_iterator.body:
+// TARGET: %[[MAPPER_SLOT:.*]] = getelementptr inbounds ptr, ptr %[[MAPPERS6]], i64 %{{.*}}
+// TARGET: store ptr @.omp_mapper.simple_mapper, ptr %[[MAPPER_SLOT]]
+// TARGET: call void @__tgt_target_data_begin_mapper(ptr @{{.*}}, i64 -1, i32 3, ptr %{{.*}}, ptr %{{.*}}, ptr %{{.*}}, ptr %{{.*}}, ptr %{{.*}}, ptr %[[MAPPERS6]])
