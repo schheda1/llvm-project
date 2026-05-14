@@ -1242,6 +1242,21 @@ def : Pat<(v4i32 (atomic_load_128_v4i32 addr:$src)),
 def : Pat<(v4i32 (atomic_load_128_v4i32 addr:$src)),
           (VMOVAPDZ128rm addr:$src)>, Requires<[HasAVX512]>;
 
+// store atomic <2 x i64>
+def : Pat<(atomic_store_128_v2i64 (v2i64 VR128:$src), addr:$dst),
+          (MOVAPDmr addr:$dst, VR128:$src)>, Requires<[UseSSE2]>;
+def : Pat<(atomic_store_128_v2i64 (v2i64 VR128:$src), addr:$dst),
+          (VMOVAPDmr addr:$dst, VR128:$src)>, Requires<[UseAVX]>;
+def : Pat<(atomic_store_128_v2i64 (v2i64 VR128X:$src), addr:$dst),
+          (VMOVAPDZ128mr addr:$dst, VR128X:$src)>, Requires<[HasAVX512]>;
+// store atomic <4 x i32>
+def : Pat<(atomic_store_128_v4i32 (v4i32 VR128:$src), addr:$dst),
+          (MOVAPDmr addr:$dst, VR128:$src)>, Requires<[UseSSE2]>;
+def : Pat<(atomic_store_128_v4i32 (v4i32 VR128:$src), addr:$dst),
+          (VMOVAPDmr addr:$dst, VR128:$src)>, Requires<[UseAVX]>;
+def : Pat<(atomic_store_128_v4i32 (v4i32 VR128X:$src), addr:$dst),
+          (VMOVAPDZ128mr addr:$dst, VR128X:$src)>, Requires<[HasAVX512]>;
+
 // store atomic <2 x i8>
 def : Pat<(atomic_store_16
             (i16 (trunc (i32 (extractelt
@@ -1293,6 +1308,37 @@ def : Pat<(atomic_store_32
                    (v4i32 (bitconvert (v16i8 VR128X:$src))), (iPTR 0))),
             addr:$dst),
           (VMOVPDI2DIZmr addr:$dst, VR128X:$src)>, Requires<[HasAVX512]>;
+// store atomic <2 x half>, <2 x bfloat> (via widened v8f16, v8bf16)
+def : Pat<(atomic_store_32
+            (i32 (extractelt
+                   (v4i32 (bitconvert (v8f16 VR128:$src))), (iPTR 0))),
+            addr:$dst),
+          (MOVPDI2DImr addr:$dst, VR128:$src)>, Requires<[UseSSE2]>;
+def : Pat<(atomic_store_32
+            (i32 (extractelt
+                   (v4i32 (bitconvert (v8bf16 VR128:$src))), (iPTR 0))),
+            addr:$dst),
+          (MOVPDI2DImr addr:$dst, VR128:$src)>, Requires<[UseSSE2]>;
+def : Pat<(atomic_store_32
+            (i32 (extractelt
+                   (v4i32 (bitconvert (v8f16 VR128:$src))), (iPTR 0))),
+            addr:$dst),
+          (VMOVPDI2DImr addr:$dst, VR128:$src)>, Requires<[UseAVX]>;
+def : Pat<(atomic_store_32
+            (i32 (extractelt
+                   (v4i32 (bitconvert (v8bf16 VR128:$src))), (iPTR 0))),
+            addr:$dst),
+          (VMOVPDI2DImr addr:$dst, VR128:$src)>, Requires<[UseAVX]>;
+def : Pat<(atomic_store_32
+            (i32 (extractelt
+                   (v4i32 (bitconvert (v8f16 VR128X:$src))), (iPTR 0))),
+            addr:$dst),
+          (VMOVPDI2DIZmr addr:$dst, VR128X:$src)>, Requires<[HasAVX512]>;
+def : Pat<(atomic_store_32
+            (i32 (extractelt
+                   (v4i32 (bitconvert (v8bf16 VR128X:$src))), (iPTR 0))),
+            addr:$dst),
+          (VMOVPDI2DIZmr addr:$dst, VR128X:$src)>, Requires<[HasAVX512]>;
 
 // store atomic <2 x i32,float>, <4 x i16>, <2 x ptr addrspace(270)>
 def : Pat<(atomic_store_64
@@ -1338,6 +1384,37 @@ def : Pat<(atomic_store_64
 def : Pat<(atomic_store_64
             (i64 (extractelt
                    (v2i64 (bitconvert (v8i16 VR128X:$src))), (iPTR 0))),
+            addr:$dst),
+          (VMOVPQI2QIZmr addr:$dst, VR128X:$src)>, Requires<[HasAVX512]>;
+// store atomic <4 x half>, <4 x bfloat> (via widened v8f16, v8bf16)
+def : Pat<(atomic_store_64
+            (i64 (extractelt
+                   (v2i64 (bitconvert (v8f16 VR128:$src))), (iPTR 0))),
+            addr:$dst),
+          (MOVPQI2QImr addr:$dst, VR128:$src)>, Requires<[UseSSE2]>;
+def : Pat<(atomic_store_64
+            (i64 (extractelt
+                   (v2i64 (bitconvert (v8bf16 VR128:$src))), (iPTR 0))),
+            addr:$dst),
+          (MOVPQI2QImr addr:$dst, VR128:$src)>, Requires<[UseSSE2]>;
+def : Pat<(atomic_store_64
+            (i64 (extractelt
+                   (v2i64 (bitconvert (v8f16 VR128:$src))), (iPTR 0))),
+            addr:$dst),
+          (VMOVPQI2QImr addr:$dst, VR128:$src)>, Requires<[UseAVX]>;
+def : Pat<(atomic_store_64
+            (i64 (extractelt
+                   (v2i64 (bitconvert (v8bf16 VR128:$src))), (iPTR 0))),
+            addr:$dst),
+          (VMOVPQI2QImr addr:$dst, VR128:$src)>, Requires<[UseAVX]>;
+def : Pat<(atomic_store_64
+            (i64 (extractelt
+                   (v2i64 (bitconvert (v8f16 VR128X:$src))), (iPTR 0))),
+            addr:$dst),
+          (VMOVPQI2QIZmr addr:$dst, VR128X:$src)>, Requires<[HasAVX512]>;
+def : Pat<(atomic_store_64
+            (i64 (extractelt
+                   (v2i64 (bitconvert (v8bf16 VR128X:$src))), (iPTR 0))),
             addr:$dst),
           (VMOVPQI2QIZmr addr:$dst, VR128X:$src)>, Requires<[HasAVX512]>;
 

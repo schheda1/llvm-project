@@ -32967,6 +32967,19 @@ X86TargetLowering::shouldCastAtomicLoadInIR(LoadInst *LI) const {
   return AtomicExpansionKind::None;
 }
 
+TargetLowering::AtomicExpansionKind
+X86TargetLowering::shouldCastAtomicStoreInIR(StoreInst *SI) const {
+  Type *Ty = SI->getValueOperand()->getType();
+  if (!Ty->getScalarType()->isFloatingPointTy())
+    return AtomicExpansionKind::None;
+  // Sub-128-bit FP vectors codegen better when DAG widening folds the value
+  // into an extractelt-from-XMM pattern, instead of an IR-level bitcast to a
+  // scalar integer (which the type legalizer scalarizes).
+  if (Ty->isVectorTy() && Ty->getPrimitiveSizeInBits() < 128)
+    return AtomicExpansionKind::None;
+  return AtomicExpansionKind::CastToInteger;
+}
+
 LoadInst *
 X86TargetLowering::lowerIdempotentRMWIntoFencedLoad(AtomicRMWInst *AI) const {
   unsigned NativeWidth = Subtarget.is64Bit() ? 64 : 32;

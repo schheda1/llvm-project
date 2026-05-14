@@ -2393,6 +2393,20 @@ def atomic_store_128 :
   let MemoryVT = i128;
 }
 
+def atomic_store_128_v2i64 :
+  PatFrag<(ops node:$val, node:$ptr),
+          (atomic_store node:$val, node:$ptr)> {
+  let IsAtomic = true;
+  let MemoryVT = v2i64;
+}
+
+def atomic_store_128_v4i32 :
+  PatFrag<(ops node:$val, node:$ptr),
+          (atomic_store node:$val, node:$ptr)> {
+  let IsAtomic = true;
+  let MemoryVT = v4i32;
+}
+
 //===----------------------------------------------------------------------===//
 // Selection DAG Pattern Support.
 //
