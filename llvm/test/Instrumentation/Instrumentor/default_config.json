@@ -18,6 +18,8 @@
   "module_pre": {
     "module": {
       "enabled": true,
+      "filter": "",
+      "filter.description": "Static property filter to exclude instrumentation.",
       "module_name": true,
       "module_name.description": "The module/translation unit name.",
       "target_triple": true,
@@ -29,6 +31,8 @@
   "module_post": {
     "module": {
       "enabled": true,
+      "filter": "",
+      "filter.description": "Static property filter to exclude instrumentation.",
       "module_name": true,
       "module_name.description": "The module/translation unit name.",
       "target_triple": true,
@@ -40,6 +44,8 @@
   "global_pre": {
     "global": {
       "enabled": true,
+      "filter": "",
+      "filter.description": "Static property filter to exclude instrumentation.",
       "address": true,
       "address.replace": true,
       "address.description": "The address of the global (replaceable for definitions).",
@@ -64,6 +70,8 @@
   "global_post": {
     "global": {
       "enabled": true,
+      "filter": "",
+      "filter.description": "Static property filter to exclude instrumentation.",
       "address": true,
       "address.description": "The address of the global (replaceable for definitions).",
       "address_space": true,
@@ -140,6 +148,8 @@
       "pointer.description": "The accessed pointer.",
       "pointer_as": true,
       "pointer_as.description": "The address space of the accessed pointer.",
+      "base_pointer_info": true,
+      "base_pointer_info.description": "The runtime provided base pointer info.",
       "value_size": true,
       "value_size.description": "The size of the loaded value.",
       "alignment": true,
@@ -176,6 +186,8 @@
       "pointer.description": "The accessed pointer.",
       "pointer_as": true,
       "pointer_as.description": "The address space of the accessed pointer.",
+      "base_pointer_info": true,
+      "base_pointer_info.description": "The runtime provided base pointer info.",
       "value": true,
       "value.description": "The stored value.",
       "value_size": true,
@@ -203,6 +215,8 @@
       "pointer.description": "The accessed pointer.",
       "pointer_as": true,
       "pointer_as.description": "The address space of the accessed pointer.",
+      "base_pointer_info": true,
+      "base_pointer_info.description": "The runtime provided base pointer info.",
       "value": true,
       "value.replace": true,
       "value.description": "The loaded value.",
@@ -243,6 +257,8 @@
       "pointer.description": "The accessed pointer.",
       "pointer_as": true,
       "pointer_as.description": "The address space of the accessed pointer.",
+      "base_pointer_info": true,
+      "base_pointer_info.description": "The runtime provided base pointer info.",
       "value": true,
       "value.description": "The stored value.",
       "value_size": true,
@@ -257,6 +273,20 @@
       "sync_scope_id.description": "The sync scope id of the store.",
       "is_volatile": true,
       "is_volatile.description": "Flag indicating a volatile store.",
+      "id": true,
+      "id.description": "A unique ID associated with the given instrumentor call"
+    }
+  },
+  "special_value": {
+    "base_pointer_info": {
+      "enabled": true,
+      "filter": "",
+      "filter.description": "Static property filter to exclude instrumentation.",
+      "base_pointer": true,
+      "base_pointer.replace": true,
+      "base_pointer.description": "The base pointer in question.",
+      "base_pointer_kind": true,
+      "base_pointer_kind.description": "The base pointer kind (argument, global, instruction, unknown).",
       "id": true,
       "id.description": "A unique ID associated with the given instrumentor call"
     }

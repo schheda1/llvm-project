@@ -22,6 +22,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/iterator.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
@@ -513,6 +514,7 @@ BaseConfigurationOption::createStringOption(InstrumentationConfig &IConf,
 
 void InstrumentationConfig::populate(InstrumentorIRBuilderTy &IIRB) {
   /// List of all instrumentation opportunities.
+  BasePointerIO::populate(*this, IIRB);
   ModuleIO::populate(*this, IIRB);
   GlobalVarIO::populate(*this, IIRB);
   FunctionIO::populate(*this, IIRB);
@@ -525,7 +527,9 @@ void InstrumentationConfig::populate(InstrumentorIRBuilderTy &IIRB) {
 void InstrumentationConfig::addChoice(InstrumentationOpportunity &IO,
                                       LLVMContext &Ctx) {
   auto *&ICPtr = IChoices[IO.getLocationKind()][IO.getName()];
-  if (ICPtr) {
+  if (ICPtr &&
+      (IO.getLocationKind() != InstrumentationLocation::SPECIAL_VALUE ||
+       ICPtr->getLocationKind() != InstrumentationLocation::SPECIAL_VALUE)) {
     Ctx.diagnose(DiagnosticInfoInstrumentation(
         Twine("registered two instrumentation opportunities for the same "
               "location (") +
@@ -533,6 +537,62 @@ void InstrumentationConfig::addChoice(InstrumentationOpportunity &IO,
         DS_Warning));
   }
   ICPtr = &IO;
+}
+
+Value *
+InstrumentationConfig::getBasePointerInfo(Value &V,
+                                          InstrumentorIRBuilderTy &IIRB) {
+  Function *Fn = IIRB.IRB.GetInsertBlock()->getParent();
+
+  Value *VPtr;
+  {
+    Value *&UnderlyingVPtr = UnderlyingObjsMap[&V];
+    if (!UnderlyingVPtr)
+      UnderlyingVPtr = const_cast<Value *>(getUnderlyingObjectAggressive(&V));
+    VPtr = UnderlyingVPtr;
+  }
+
+  Value *&BPI = BasePointerInfoMap[{VPtr, Fn}];
+  if (BPI)
+    return BPI;
+
+  auto *BPIO =
+      IChoices[InstrumentationLocation::SPECIAL_VALUE]["base_pointer_info"];
+  if (!BPIO || !BPIO->Enabled) {
+    IIRB.Ctx.diagnose(DiagnosticInfoInstrumentation(
+        "Base pointer info disabled but required, passing nullptr.",
+        DS_Warning));
+    return BPI = Constant::getNullValue(BPIO->getRetTy(IIRB.Ctx));
+  }
+
+  IRBuilderBase::InsertPointGuard IP(IIRB.IRB);
+  if (auto *BasePtrI = dyn_cast<Instruction>(VPtr)) {
+    std::optional<BasicBlock::iterator> IP =
+        BasePtrI->getInsertionPointAfterDef();
+    if (IP) {
+      IIRB.IRB.SetInsertPoint(*IP);
+    } else {
+      IIRB.Ctx.diagnose(DiagnosticInfoInstrumentation(
+          "Base pointer info could not be placed, passing nullptr.",
+          DS_Warning));
+      return BPI = Constant::getNullValue(BPIO->getRetTy(IIRB.Ctx));
+    }
+  } else if (isa<Constant>(VPtr) || isa<Argument>(VPtr))
+    IIRB.IRB.SetInsertPointPastAllocas(IIRB.IRB.GetInsertBlock()->getParent());
+  else {
+    VPtr->dump();
+    llvm_unreachable("Unexpected base pointer!");
+  }
+  ensureDbgLoc(IIRB.IRB);
+
+  // Use fresh caches for safety, as this function may be called from
+  // another instrumentation opportunity.
+  InstrumentationCaches ICaches;
+  BPI = BPIO->instrument(VPtr, *this, IIRB, ICaches);
+  IIRB.returnAllocas();
+  if (!BPI)
+    BPI = Constant::getNullValue(BPIO->getRetTy(IIRB.Ctx));
+  return BPI;
 }
 
 Value *InstrumentationOpportunity::getIdPre(Value &V, Type &Ty,
@@ -1004,6 +1064,11 @@ void StoreIO::init(InstrumentationConfig &IConf, InstrumentorIRBuilderTy &IIRB,
                              "The address space of the accessed pointer.",
                              IRTArg::NONE, getPointerAS));
   }
+  if (Config.has(PassBasePointerInfo)) {
+    IRTArgs.push_back(IRTArg(IIRB.PtrTy, "base_pointer_info",
+                             "The runtime provided base pointer info.",
+                             IRTArg::NONE, getBasePointerInfo));
+  }
   if (Config.has(PassStoredValue)) {
     IRTArgs.push_back(
         IRTArg(getValueType(IIRB), "value", "The stored value.",
@@ -1066,6 +1131,13 @@ Value *StoreIO::getPointerAS(Value &V, Type &Ty, InstrumentationConfig &IConf,
   return getCI(&Ty, SI.getPointerAddressSpace());
 }
 
+Value *StoreIO::getBasePointerInfo(Value &V, Type &Ty,
+                                   InstrumentationConfig &IConf,
+                                   InstrumentorIRBuilderTy &IIRB) {
+  auto &SI = cast<StoreInst>(V);
+  return IConf.getBasePointerInfo(*SI.getPointerOperand(), IIRB);
+}
+
 Value *StoreIO::getValue(Value &V, Type &Ty, InstrumentationConfig &IConf,
                          InstrumentorIRBuilderTy &IIRB) {
   auto &SI = cast<StoreInst>(V);
@@ -1126,6 +1198,11 @@ void LoadIO::init(InstrumentationConfig &IConf, InstrumentorIRBuilderTy &IIRB,
     IRTArgs.push_back(IRTArg(IIRB.Int32Ty, "pointer_as",
                              "The address space of the accessed pointer.",
                              IRTArg::NONE, getPointerAS));
+  }
+  if (Config.has(PassBasePointerInfo)) {
+    IRTArgs.push_back(IRTArg(IIRB.PtrTy, "base_pointer_info",
+                             "The runtime provided base pointer info.",
+                             IRTArg::NONE, getBasePointerInfo));
   }
   if (!IsPRE && Config.has(PassValue)) {
     IRTArgs.push_back(
@@ -1191,6 +1268,13 @@ Value *LoadIO::getPointerAS(Value &V, Type &Ty, InstrumentationConfig &IConf,
   return getCI(&Ty, LI.getPointerAddressSpace());
 }
 
+Value *LoadIO::getBasePointerInfo(Value &V, Type &Ty,
+                                  InstrumentationConfig &IConf,
+                                  InstrumentorIRBuilderTy &IIRB) {
+  auto &LI = cast<LoadInst>(V);
+  return IConf.getBasePointerInfo(*LI.getPointerOperand(), IIRB);
+}
+
 Value *LoadIO::getValue(Value &V, Type &Ty, InstrumentationConfig &IConf,
                         InstrumentorIRBuilderTy &IIRB) {
   return &V;
@@ -1232,6 +1316,35 @@ Value *LoadIO::isVolatile(Value &V, Type &Ty, InstrumentationConfig &IConf,
                           InstrumentorIRBuilderTy &IIRB) {
   auto &LI = cast<LoadInst>(V);
   return getCI(&Ty, LI.isVolatile());
+}
+
+void BasePointerIO::init(InstrumentationConfig &IConf,
+                         InstrumentorIRBuilderTy &IIRB, ConfigTy *UserConfig) {
+  if (UserConfig)
+    Config = *UserConfig;
+  if (Config.has(PassPointer))
+    IRTArgs.push_back(IRTArg(IIRB.PtrTy, "base_pointer",
+                             "The base pointer in question.",
+                             IRTArg::REPLACABLE, getValue, setValueNoop));
+  if (Config.has(PassPointerKind))
+    IRTArgs.push_back(IRTArg(
+        IIRB.Int32Ty, "base_pointer_kind",
+        "The base pointer kind (argument, global, instruction, unknown).",
+        IRTArg::NONE, getPointerKind));
+  addCommonArgs(IConf, IIRB.Ctx, Config.has(PassId));
+  IConf.addChoice(*this, IIRB.Ctx);
+}
+
+Value *BasePointerIO::getPointerKind(Value &V, Type &Ty,
+                                     InstrumentationConfig &IConf,
+                                     InstrumentorIRBuilderTy &IIRB) {
+  if (isa<Argument>(V))
+    return getCI(&Ty, 0);
+  if (isa<GlobalValue>(V))
+    return getCI(&Ty, 1);
+  if (isa<Instruction>(V))
+    return getCI(&Ty, 2);
+  return getCI(&Ty, 3);
 }
 
 void ModuleIO::init(InstrumentationConfig &IConf, InstrumentorIRBuilderTy &IIRB,
