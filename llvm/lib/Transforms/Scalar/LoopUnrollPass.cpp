@@ -174,6 +174,25 @@ static cl::opt<unsigned>
                            cl::desc("Default threshold (max size of unrolled "
                                     "loop), used in all but O3 optimizations"));
 
+static cl::opt<std::string> matchesTargetTriple(
+    "unroll-match-targettriple", cl::init("-"),
+    cl::desc("If this is set, then this will only be applied if the Module's "
+             "target triple is equal to matchesTargetTriple"),
+    cl::CommaSeparated);
+static cl::opt<std::string> matchesFilename(
+    "unroll-match-filename", cl::init("-"),
+    cl::desc("If this is set, then this pass will only be applied if the "
+             "current file is equal to matchesFilename."),
+    cl::CommaSeparated);
+static cl::list<int> optLoopIdx(
+    "unroll-opt-loop-idx",
+    cl::desc(
+        "If opt-loop-idx is set, only loops with index in optLoopIdx will be "
+        "optimized and all other loops will remain unchanged."),
+    cl::CommaSeparated);
+
+static int seenLoops = 0;
+
 static cl::opt<unsigned> PragmaUnrollFullMaxIterations(
     "pragma-unroll-full-max-iterations", cl::init(1'000'000), cl::Hidden,
     cl::desc("Maximum allowed iterations to unroll under pragma unroll full."));
@@ -1649,14 +1668,81 @@ PreservedAnalyses LoopUnrollPass::run(Function &F,
     if (PSI && PSI->hasHugeWorkingSetSize())
       LocalAllowPeeling = false;
     std::string LoopName = std::string(L.getName());
+
+    if (UnrollOpts.UnrollCount != std::nullopt) {
+      if (matchesTargetTriple != "-") {
+        std::string targetTriple =
+            L.getHeader()->getParent()->getParent()->getTargetTriple();
+        if (matchesTargetTriple != targetTriple) {
+          dbgs() << "Skipped " << targetTriple << " != " << matchesTargetTriple
+                 << " loop " << seenLoops << "\n";
+          seenLoops++;
+          continue;
+        }
+      }
+
+      if (matchesFilename != "-") {
+        std::string filename =
+            L.getHeader()->getParent()->getParent()->getSourceFileName();
+        if (matchesFilename != filename) {
+          dbgs() << "Skipped " << filename << " != " << matchesFilename
+                 << " loop " << seenLoops << "\n";
+          seenLoops++;
+          continue;
+        }
+      }
+
+      if (!optLoopIdx.empty() && std::find(optLoopIdx.begin(), optLoopIdx.end(),
+                                           seenLoops) == optLoopIdx.end()) {
+        dbgs() << "Skipped loop " << seenLoops << "\n";
+        seenLoops++;
+        continue;
+      } else {
+        dbgs() << "LoopUnrollPass: Optimizing loop " << seenLoops << "\n";
+        seenLoops++;
+        Loop *RemainderLoop = nullptr;
+        if (UnrollOpts.UnrollCount.value() == 0) {
+          errs() << "Unroll count is 0: Not unrolling and disabling subsequent "
+                    "unrolling\n";
+          L.setLoopAlreadyUnrolled();
+          continue;
+        }
+        UnrollLoopOptions ULO = {};
+        ULO.Count = UnrollOpts.UnrollCount.value();
+        ULO.Force = true;
+        ULO.Runtime = false;
+        ULO.AllowExpensiveTripCount = true;
+        ULO.UnrollRemainder = false;
+        ULO.ForgetAllSCEV = true;
+        ULO.SCEVExpansionBudget = std::numeric_limits<unsigned>::max();
+        LoopUnrollResult Result =
+            UnrollLoop(&L, ULO, &LI, &SE, &DT, &AC, &TTI, &ORE, true,
+                       &RemainderLoop);
+
+        Changed |= Result != LoopUnrollResult::Unmodified;
+
+#ifndef NDEBUG
+        if (Result != LoopUnrollResult::Unmodified && ParentL)
+          ParentL->verifyLoop();
+#endif
+
+        if (LAM && Result == LoopUnrollResult::FullyUnrolled)
+          LAM->clear(L, LoopName);
+
+        if (Result != LoopUnrollResult::FullyUnrolled)
+          L.setLoopAlreadyUnrolled();
+        continue;
+      }
+    }
+
     // The API here is quite complex to call and we allow to select some
     // flavors of unrolling during construction time (by setting UnrollOpts).
     LoopUnrollResult Result = tryToUnrollLoop(
         &L, DT, &LI, SE, TTI, AC, ORE, BFI, PSI,
         /*PreserveLCSSA*/ true, UnrollOpts.OptLevel, /*OnlyFullUnroll*/ false,
         UnrollOpts.OnlyWhenForced, UnrollOpts.ForgetSCEV,
-        /*Count*/ std::nullopt,
-        /*Threshold*/ std::nullopt, UnrollOpts.AllowPartial,
+        /*Count*/ UnrollOpts.UnrollCount,
+        /*Threshold*/ UnrollOpts.UnrollThreshold, UnrollOpts.AllowPartial,
         UnrollOpts.AllowRuntime, UnrollOpts.AllowUpperBound, LocalAllowPeeling,
         UnrollOpts.AllowProfileBasedPeeling, UnrollOpts.FullUnrollMaxCount,
         &AA);

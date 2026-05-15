@@ -193,6 +193,21 @@ static cl::opt<bool> RunPartialInlining("enable-partial-inlining",
                                         cl::init(false), cl::Hidden,
                                         cl::desc("Run Partial inlining pass"));
 
+static cl::opt<bool> EnableUU("enable-uu", cl::init(false),
+                              cl::desc("Enable Unroll & Unmerge Pass."));
+static cl::opt<bool> EnableLoopCount("enable-loopcount", cl::init(false),
+                                     cl::desc("Enable LoopCountPass."));
+static cl::opt<bool>
+    EnableForceUnroll("enable-unroll", cl::init(false),
+                      cl::desc("Force enables LoopUnrollPass."));
+static cl::opt<unsigned> forceUnrollFactor(
+    "force-unroll-unrollfactor", cl::init(1),
+    cl::desc(
+        "Set the unrolling factor when the LoopUnrollPass is force enabled."));
+static cl::opt<bool>
+    EnableUUHeuristic("enable-uu-heuristic", cl::init(false),
+                      cl::desc("Enable unroll and unmerge heuristic."));
+
 static cl::opt<bool> ExtraVectorizerPasses(
     "extra-vectorizer-passes", cl::init(false), cl::Hidden,
     cl::desc("Run cleanup optimization passes after vectorization"));
@@ -1070,6 +1085,11 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
          "FullLTOPostLink shouldn't call buildModuleSimplificationPipeline!");
 
   ModulePassManager MPM;
+
+  addLoopCount(MPM);
+  addUnrollAndUnmergeNoHeuristic(MPM);
+  addForceUnroll(MPM, Level);
+  addUUSimple(MPM);
 
   // Place pseudo probe instrumentation as the first pass of the pipeline to
   // minimize the impact of optimization changes.
@@ -2355,4 +2375,35 @@ AAManager PassBuilder::buildDefaultAAPipeline() {
 bool PassBuilder::isInstrumentedPGOUse() const {
   return (PGOOpt && PGOOpt->Action == PGOOptions::IRUse) ||
          !UseCtxProfile.empty();
+}
+
+void PassBuilder::addForceUnroll(ModulePassManager &MPM,
+                                 OptimizationLevel &Level) {
+  if (EnableForceUnroll) {
+    MPM.addPass(
+        createModuleToFunctionPassAdaptor(LoopUnrollPass(LoopUnrollOptions(
+            Level.getSpeedupLevel(),
+            /*OnlyWhenForced=*/false, false, (unsigned)forceUnrollFactor,
+            std::numeric_limits<unsigned>::max()))));
+  }
+}
+
+void PassBuilder::addLoopCount(ModulePassManager &MPM) {
+  if (EnableLoopCount) {
+    MPM.addPass(createModuleToFunctionPassAdaptor(LoopCountFunctionPass()));
+  }
+}
+
+void PassBuilder::addUnrollAndUnmergeNoHeuristic(ModulePassManager &MPM) {
+  if (EnableUU) {
+    MPM.addPass(
+        createModuleToFunctionPassAdaptor(UnrollAndUnmergeFunctionPass()));
+  }
+}
+
+void PassBuilder::addUUSimple(ModulePassManager &MPM) {
+  if (EnableUUHeuristic) {
+    MPM.addPass(
+        createModuleToFunctionPassAdaptor(UnrollAndUnmergeHeuristic()));
+  }
 }

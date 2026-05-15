@@ -560,6 +560,7 @@ FUNCTION_PASS("view-dom-only", DomOnlyViewer())
 FUNCTION_PASS("view-post-dom", PostDomViewer())
 FUNCTION_PASS("view-post-dom-only", PostDomOnlyViewer())
 FUNCTION_PASS("wasm-eh-prepare", WasmEHPreparePass())
+FUNCTION_PASS("loopcount-function", LoopCountFunctionPass())
 #undef FUNCTION_PASS
 
 #ifndef FUNCTION_PASS_WITH_PARAMS
@@ -768,6 +769,8 @@ LOOP_PASS("print<hash-recognize>", HashRecognizePrinterPass(errs()))
 LOOP_PASS("print<iv-users>", IVUsersPrinterPass(errs()))
 LOOP_PASS("print<loop-cache-cost>", LoopCachePrinterPass(errs()))
 LOOP_PASS("print<loopnest>", LoopNestPrinterPass(errs()))
+LOOP_PASS("uu", UnrollAndUnmergePass())
+LOOP_PASS("loopcount", LoopCountPass())
 #undef LOOP_PASS
 
 #ifndef LOOP_PASS_WITH_PARAMS

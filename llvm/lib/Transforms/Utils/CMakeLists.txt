@@ -46,9 +46,12 @@ add_llvm_component_library(LLVMTransformUtils
   LoopPeel.cpp
   LoopRotationUtils.cpp
   LoopSimplify.cpp
+  LoopCount.cpp
   LoopUnroll.cpp
   LoopUnrollAndJam.cpp
   LoopUnrollRuntime.cpp
+  UnrollAndUnmerge.cpp
+  UnrollAndUnmergeUtils.cpp
   LoopUtils.cpp
   LoopVersioning.cpp
   LowerAtomic.cpp

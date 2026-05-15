@@ -738,6 +738,11 @@ private:
   void addVectorPasses(OptimizationLevel Level, FunctionPassManager &FPM,
                        bool IsFullLTO);
 
+  void addLoopCount(ModulePassManager &MPM);
+  void addForceUnroll(ModulePassManager &MPM, OptimizationLevel &Level);
+  void addUnrollAndUnmergeNoHeuristic(ModulePassManager &MPM);
+  void addUUSimple(ModulePassManager &MPM);
+
   static std::optional<std::vector<PipelineElement>>
   parsePipelineText(StringRef Text);
 

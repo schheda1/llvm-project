@@ -65,6 +65,8 @@ struct LoopUnrollOptions {
   std::optional<bool> AllowUpperBound;
   std::optional<bool> AllowProfileBasedPeeling;
   std::optional<unsigned> FullUnrollMaxCount;
+  std::optional<unsigned> UnrollCount;
+  std::optional<unsigned> UnrollThreshold;
   int OptLevel;
 
   /// If false, use a cost model to determine whether unrolling of a loop is
@@ -78,9 +80,12 @@ struct LoopUnrollOptions {
   const bool ForgetSCEV;
 
   LoopUnrollOptions(int OptLevel = 2, bool OnlyWhenForced = false,
-                    bool ForgetSCEV = false)
+                    bool ForgetSCEV = false,
+                    std::optional<unsigned> UnrollCount = std::nullopt,
+                    std::optional<unsigned> UnrollThreshold = std::nullopt)
       : OptLevel(OptLevel), OnlyWhenForced(OnlyWhenForced),
-        ForgetSCEV(ForgetSCEV) {}
+        ForgetSCEV(ForgetSCEV), UnrollCount(UnrollCount),
+        UnrollThreshold(UnrollThreshold) {}
 
   /// Enables or disables partial unrolling. When disabled only full unrolling
   /// is allowed.

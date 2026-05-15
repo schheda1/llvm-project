@@ -44,6 +44,7 @@
 #include "llvm/Transforms/Scalar/Scalarizer.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/SymbolRewriter.h"
+#include "llvm/Transforms/Utils/UnrollAndUnmerge.h"
 #include "llvm/Transforms/Vectorize/LoadStoreVectorizer.h"
 #include <cstdlib>
 
@@ -159,6 +160,7 @@ struct ForcePassLinking {
     X.add(llvm::MemoryLocation()); // for -print-alias-sets
     (void)llvm::AreStatisticsEnabled();
     (void)llvm::sys::RunningOnValgrind();
+    (void)llvm::createUnrollAndUnmergePass();
   }
 } ForcePassLinking; // Force link by creating a global definition.
 } // namespace
