@@ -131,7 +131,7 @@ long long llvm::getEstimatedLoopSize(Loop &L, InstructionCost loopSize,
     return -1;
   }
   long long estimatedLoopSize = 0;
-  long long loopSizeLL = loopSize.getValue().value();
+  long long loopSizeLL = loopSize.getValue();
   // TODO: stop early if estimatedLoopSize > some threshold
   for (int i = 0; i < unrollFactor; i++) {
     estimatedLoopSize += pow(numPaths, i) * loopSizeLL;

@@ -83,10 +83,9 @@ struct LoopUnrollOptions {
                     bool ForgetSCEV = false,
                     std::optional<unsigned> UnrollCount = std::nullopt,
                     std::optional<unsigned> UnrollThreshold = std::nullopt)
-      : OptLevel(OptLevel), OnlyWhenForced(OnlyWhenForced),
-        ForgetSCEV(ForgetSCEV), UnrollCount(UnrollCount),
-        UnrollThreshold(UnrollThreshold) {}
-
+      : UnrollCount(UnrollCount), UnrollThreshold(UnrollThreshold),
+        OptLevel(OptLevel), OnlyWhenForced(OnlyWhenForced),
+        ForgetSCEV(ForgetSCEV) {}
   /// Enables or disables partial unrolling. When disabled only full unrolling
   /// is allowed.
   LoopUnrollOptions &setPartial(bool Partial) {

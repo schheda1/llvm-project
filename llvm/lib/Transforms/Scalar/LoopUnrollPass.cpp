@@ -1672,7 +1672,7 @@ PreservedAnalyses LoopUnrollPass::run(Function &F,
     if (UnrollOpts.UnrollCount != std::nullopt) {
       if (matchesTargetTriple != "-") {
         std::string targetTriple =
-            L.getHeader()->getParent()->getParent()->getTargetTriple();
+            L.getHeader()->getParent()->getParent()->getTargetTriple().str();
         if (matchesTargetTriple != targetTriple) {
           dbgs() << "Skipped " << targetTriple << " != " << matchesTargetTriple
                  << " loop " << seenLoops << "\n";

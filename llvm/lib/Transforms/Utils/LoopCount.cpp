@@ -6,6 +6,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
@@ -101,7 +102,7 @@ void printContainsSubloops(Loop &L) {
 void printColumnHeader(int seenLoops, Module *M) {
   if (seenLoops == 0) {
     errs() << "LOOPCOUNT METADATA;" << M->getSourceFileName() << ";";
-    errs() << M->getTargetTriple();
+    errs() << M->getTargetTriple().str();
     errs() << "\n";
     errs() << "LOOPCOUNT::loopIdx;"
            << "loopDepth;"

@@ -275,7 +275,7 @@ static BasicBlock *dfsAndDuplicate(UnmergeInfo &unmergeInfo) {
 static bool checkMatchesTargetTriple(Loop &L) {
   if (matchesTargetTriple != "-") {
     std::string targetTriple =
-        L.getHeader()->getParent()->getParent()->getTargetTriple();
+        L.getHeader()->getParent()->getParent()->getTargetTriple().str();
     if (matchesTargetTriple != targetTriple) {
       LLVM_DEBUG(dbgs() << "Skipped " << targetTriple
                         << " != " << matchesTargetTriple << " loop "
