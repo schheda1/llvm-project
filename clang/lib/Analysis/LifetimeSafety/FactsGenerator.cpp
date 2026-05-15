@@ -882,7 +882,7 @@ void FactsGenerator::handleFunctionCall(const Expr *Call,
   handleImplicitObjectFieldUses(Call, FD);
   if (!CallList)
     return;
-  auto IsArgLifetimeBound = [FD](unsigned I) -> bool {
+  auto IsArgLifetimeBound = [FD, &Args](unsigned I) -> bool {
     const ParmVarDecl *PVD = nullptr;
     if (const auto *Method = dyn_cast<CXXMethodDecl>(FD);
         Method && Method->isInstance() && !isa<CXXConstructorDecl>(FD)) {
@@ -890,7 +890,8 @@ void FactsGenerator::handleFunctionCall(const Expr *Call,
         // For the 'this' argument, the attribute is on the method itself.
         return implicitObjectParamIsLifetimeBound(Method) ||
                shouldTrackImplicitObjectArg(
-                   Method, /*RunningUnderLifetimeSafety=*/true);
+                   Method, /*RunningUnderLifetimeSafety=*/true,
+                   Args[0]->IgnoreParenBaseCasts()->getType());
       if ((I - 1) < Method->getNumParams())
         // For explicit arguments, find the corresponding parameter
         // declaration.

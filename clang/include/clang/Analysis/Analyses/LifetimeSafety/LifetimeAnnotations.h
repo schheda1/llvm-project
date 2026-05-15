@@ -57,8 +57,14 @@ bool implicitObjectParamIsLifetimeBound(const FunctionDecl *FD);
 // container iterators (begin, end), data accessors (c_str, data, get),
 // element accessors (operator[], operator*, front, back, at), or propagating
 // operations (operator+, operator-, operator++, operator--).
-bool shouldTrackImplicitObjectArg(const CXXMethodDecl *Callee,
-                                  bool RunningUnderLifetimeSafety);
+//
+// `ImplicitObjectArgumentType` is the static type of the implicit object
+// argument before any `DerivedToBase` cast (e.g., from
+// `Arg->IgnoreParenBaseCasts()->getType()`). Included in the `gsl::Owner`
+// check so inherited methods on non-annotated bases are still tracked.
+bool shouldTrackImplicitObjectArg(
+    const CXXMethodDecl *Callee, bool RunningUnderLifetimeSafety,
+    QualType ImplicitObjectArgumentType = QualType());
 
 // Returns true if the first argument of a free function should be tracked for
 // GSL lifetime analysis. This applies to STL free functions that take a pointer

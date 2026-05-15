@@ -121,15 +121,19 @@ static bool isReferenceOrPointerLikeType(QualType QT) {
 }
 
 bool shouldTrackImplicitObjectArg(const CXXMethodDecl *Callee,
-                                  bool RunningUnderLifetimeSafety) {
+                                  bool RunningUnderLifetimeSafety,
+                                  QualType ImplicitObjectArgumentType) {
   if (!Callee)
     return false;
+  const bool IsGslOwnerImplicitObject =
+      isGslOwnerType(Callee->getFunctionObjectParameterType()) ||
+      (!ImplicitObjectArgumentType.isNull() &&
+       isGslOwnerType(ImplicitObjectArgumentType));
   if (auto *Conv = dyn_cast<CXXConversionDecl>(Callee))
-    if (isGslPointerType(Conv->getConversionType()) &&
-        Callee->getParent()->hasAttr<OwnerAttr>())
+    if (isGslPointerType(Conv->getConversionType()) && IsGslOwnerImplicitObject)
       return true;
   if (!isGslPointerType(Callee->getFunctionObjectParameterType()) &&
-      !isGslOwnerType(Callee->getFunctionObjectParameterType()))
+      !IsGslOwnerImplicitObject)
     return false;
 
   // Begin and end iterators.
@@ -173,7 +177,7 @@ bool shouldTrackImplicitObjectArg(const CXXMethodDecl *Callee,
     if (!Callee->getIdentifier())
       // e.g., std::optional<T>::operator->() returns T*.
       return RunningUnderLifetimeSafety
-                 ? Callee->getParent()->hasAttr<OwnerAttr>() &&
+                 ? IsGslOwnerImplicitObject &&
                        Callee->getOverloadedOperator() ==
                            OverloadedOperatorKind::OO_Arrow
                  : false;
@@ -184,7 +188,7 @@ bool shouldTrackImplicitObjectArg(const CXXMethodDecl *Callee,
   if (Callee->getReturnType()->isReferenceType()) {
     if (!Callee->getIdentifier()) {
       auto OO = Callee->getOverloadedOperator();
-      if (!Callee->getParent()->hasAttr<OwnerAttr>())
+      if (!IsGslOwnerImplicitObject)
         return false;
       return OO == OverloadedOperatorKind::OO_Subscript ||
              OO == OverloadedOperatorKind::OO_Star;
