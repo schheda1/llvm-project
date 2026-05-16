@@ -1088,8 +1088,8 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
 
   ModulePassManager MPM;
 
-  addLoopCount(MPM);
   addUnrollAndUnmergeNoHeuristic(MPM);
+  addLoopCount(MPM);
   addForceUnroll(MPM, Level);
   addUUSimple(MPM);
 

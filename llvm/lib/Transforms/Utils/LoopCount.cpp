@@ -123,6 +123,7 @@ void printColumnHeader(int seenLoops, Module *M) {
            << "containsBarrier;"
            << "containsChildLoops;"
            << "containsBranch;"
+           << "tripCountKnown;"
            << "tripCount\n";
   }
 }
@@ -160,8 +161,9 @@ static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
   printContainsBarrier(L);
   printContainsSubloops(L);
   printContainsBranch(L);
-  errs() << ";";
-  errs() << SE.getSmallConstantTripCount(&L);
+  unsigned tripCount = SE.getSmallConstantTripCount(&L);
+  errs() << ";" << (tripCount > 0 ? 1 : 0);
+  errs() << ";" << tripCount;
   errs() << "\n";
 }
 
