@@ -43,6 +43,18 @@ static cl::list<int> optLoopIdx(
         "optimized and all other loops will remain unchanged."),
     cl::CommaSeparated);
 
+static cl::list<unsigned> optLoopUnrollFactors(
+    "uu-opt-loop-unrollfactors",
+    cl::desc("Per-loop unroll factors, positionally matched to "
+             "uu-opt-loop-idx. 1 = no unroll. Valid values: 1-10, 16, 32."),
+    cl::CommaSeparated);
+
+static cl::list<int> optLoopUnmerge(
+    "uu-opt-loop-unmerge",
+    cl::desc("Per-loop unmerge flags (1=apply unmerge, 0=skip), positionally "
+             "matched to uu-opt-loop-idx."),
+    cl::CommaSeparated);
+
 struct UnmergeInfo {
   BasicBlock *BB;
   BasicBlock *startCutpoint;
@@ -436,6 +448,45 @@ static bool skipLoop(Loop &L) {
   return false;
 }
 
+// Returns {shouldSkip, doUnmerge, factor}.  Always increments seenLoops
+// exactly once. Used by UnrollAndUnmergeFunctionPass for per-loop RL dispatch.
+static std::tuple<bool, bool, unsigned>
+getLoopDispatch(Loop &L, ScalarEvolution *SE) {
+  if (!checkMatchesTargetTriple(L))
+    return {true, true, (unsigned)uuUnrollFactor};
+  if (!checkMatchesFilename(L))
+    return {true, true, (unsigned)uuUnrollFactor};
+
+  if (!optLoopIdx.empty()) {
+    auto it = std::find(optLoopIdx.begin(), optLoopIdx.end(), seenLoops);
+    if (it == optLoopIdx.end()) {
+      LLVM_DEBUG(dbgs() << "Skipped loop " << seenLoops << "\n");
+      seenLoops++;
+      return {true, true, (unsigned)uuUnrollFactor};
+    }
+    size_t k = std::distance(optLoopIdx.begin(), it);
+    LLVM_DEBUG(dbgs() << "Optimizing loop " << seenLoops << "\n");
+    seenLoops++;
+
+    bool doUnmerge = optLoopUnmerge.empty() ? true : (optLoopUnmerge[k] != 0);
+    unsigned factor = optLoopUnrollFactors.empty()
+                          ? (unsigned)uuUnrollFactor
+                          : optLoopUnrollFactors[k];
+
+    if (SE) {
+      unsigned tripCount = SE->getSmallConstantTripCount(&L);
+      if (tripCount > 0 && factor > tripCount)
+        factor = tripCount;
+    }
+
+    return {false, doUnmerge, factor};
+  }
+
+  LLVM_DEBUG(dbgs() << "Optimizing loop " << seenLoops << "\n");
+  seenLoops++;
+  return {false, true, (unsigned)uuUnrollFactor};
+}
+
 static void postProcessing(Loop &L, Loop *clonedLoop, Function *F, LoopInfo &LI,
                            DominatorTree &DT, ScalarEvolution &SE,
                            AssumptionCache &AC) {
@@ -655,7 +706,12 @@ PreservedAnalyses UnrollAndUnmergeFunctionPass::run(Function &F,
 
   while (!Worklist.empty()) {
     Loop &L = *Worklist.pop_back_val();
-    std::pair<bool, Loop *> result = unmerge(L, LI, DT, SE, TTI, AC, nullptr);
+    auto [skip, doUnmerge, factor] = getLoopDispatch(L, &SE);
+    if (skip || !doUnmerge)
+      continue;
+    std::pair<bool, Loop *> result =
+        unmerge(L, LI, DT, SE, TTI, AC, nullptr, /*checkSkip=*/false,
+                (int)factor);
     changed |= result.first;
   }
 
