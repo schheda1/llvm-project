@@ -6,7 +6,10 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/InstrTypes.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
@@ -95,6 +98,51 @@ void printContainsBranch(Loop &L) {
   errs() << loopContainsBranch(L);
 }
 
+struct InstructionCounts {
+  unsigned numBasicBlocks = 0;
+  unsigned numMemoryInsts = 0;
+  unsigned numComputeInsts = 0;
+  unsigned numControlFlowInsts = 0;
+  unsigned numVectorInsts = 0;
+};
+
+static InstructionCounts getInstructionCounts(Loop &L) {
+  InstructionCounts counts;
+  for (BasicBlock *BB : L.blocks()) {
+    counts.numBasicBlocks++;
+    for (Instruction &I : *BB) {
+      // Memory
+      if (isa<LoadInst>(I) || isa<StoreInst>(I) ||
+          isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I)) {
+        counts.numMemoryInsts++;
+      }
+      // Compute: arithmetic, comparisons, casts
+      else if (isa<BinaryOperator>(I) || isa<UnaryOperator>(I) ||
+               isa<CmpInst>(I) || isa<CastInst>(I)) {
+        counts.numComputeInsts++;
+      }
+      // Control flow
+      else if (isa<BranchInst>(I) || isa<SwitchInst>(I) || isa<CallInst>(I)) {
+        counts.numControlFlowInsts++;
+      }
+      // Vector result type (cuts across all categories)
+      if (I.getType()->isVectorTy()) {
+        counts.numVectorInsts++;
+      }
+    }
+  }
+  return counts;
+}
+
+void printInstructionCounts(Loop &L) {
+  InstructionCounts counts = getInstructionCounts(L);
+  errs() << counts.numBasicBlocks << ";";
+  errs() << counts.numMemoryInsts << ";";
+  errs() << counts.numComputeInsts << ";";
+  errs() << counts.numControlFlowInsts << ";";
+  errs() << counts.numVectorInsts;
+}
+
 void printContainsSubloops(Loop &L) {
   errs() << !L.isInnermost() << ";";
 }
@@ -124,7 +172,12 @@ void printColumnHeader(int seenLoops, Module *M) {
            << "containsChildLoops;"
            << "containsBranch;"
            << "tripCountKnown;"
-           << "tripCount\n";
+           << "tripCount;"
+           << "numBasicBlocks;"
+           << "numMemoryInsts;"
+           << "numComputeInsts;"
+           << "numControlFlowInsts;"
+           << "numVectorInsts\n";
   }
 }
 
@@ -163,7 +216,8 @@ static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
   printContainsBranch(L);
   unsigned tripCount = SE.getSmallConstantTripCount(&L);
   errs() << ";" << (tripCount > 0 ? 1 : 0);
-  errs() << ";" << tripCount;
+  errs() << ";" << tripCount << ";";
+  printInstructionCounts(L);
   errs() << "\n";
 }
 
