@@ -97,6 +97,39 @@ void printContainsBranch(Loop &L) {
   errs() << loopContainsBranch(L);
 }
 
+void printContainsCall(Loop &L) {
+  // True if the loop body contains at least one non-intrinsic call instruction.
+  // Intrinsics (llvm.dbg.*, llvm.lifetime.*, etc.) are excluded because they
+  // are typically lowered to nothing and do not inhibit unrolling.
+  // Mirrors the check used by LLVM's loop unroller to detect calls that
+  // prevent or limit unrolling due to code-size and ABI side effects.
+  bool containsCall = false;
+  for (BasicBlock *BB : L.blocks()) {
+    if (containsCall)
+      break;
+    for (Instruction &I : *BB) {
+      if (auto *CI = dyn_cast<CallInst>(&I)) {
+        if (!CI->isIntrinsic()) {
+          containsCall = true;
+          break;
+        }
+      }
+    }
+  }
+  errs() << ";" << containsCall;
+}
+
+void printNumExits(Loop &L) {
+  // Number of blocks inside the loop that have at least one edge leaving the
+  // loop (exiting blocks).  Mirrors L.getExitBlock() == nullptr check used
+  // by the LLVM unroller: a single exiting block (numExits == 1) means a
+  // simple, predictable exit; multiple exiting blocks complicate unrolling
+  // because each unrolled copy may exit early and requires separate handling.
+  SmallVector<BasicBlock *, 8> ExitingBlocks;
+  L.getExitingBlocks(ExitingBlocks);
+  errs() << ";" << ExitingBlocks.size();
+}
+
 struct InstructionCounts {
   unsigned numBasicBlocks = 0;
   unsigned numMemoryInsts = 0;
@@ -164,7 +197,9 @@ void printColumnHeader(int seenLoops, Module *M) {
            << "numBasicBlocks;"
            << "numMemoryInsts;"
            << "numComputeInsts;"
-           << "numControlFlowInsts\n";
+           << "numControlFlowInsts;"
+           << "containsCall;"
+           << "numExits\n";
   }
 }
 
@@ -205,6 +240,8 @@ static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
   errs() << ";" << (tripCount > 0 ? 1 : 0);
   errs() << ";" << tripCount << ";";
   printInstructionCounts(L);
+  printContainsCall(L);
+  printNumExits(L);
   errs() << "\n";
 }
 
