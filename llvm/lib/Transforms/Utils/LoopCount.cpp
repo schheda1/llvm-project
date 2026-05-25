@@ -1,10 +1,13 @@
 #include "llvm/Transforms/Utils/LoopCount.h"
 #include "llvm/ADT/PriorityWorklist.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CodeMetrics.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
@@ -18,6 +21,58 @@ using namespace llvm;
 
 int LoopCountPass::seenLoops = 0;
 int LoopCountFunctionPass::seenLoopsFunction = 0;
+
+// ---------------------------------------------------------------------------
+// Kernel parent tracking
+// ---------------------------------------------------------------------------
+
+/// Return true if F is a PTX kernel entry point (__global__ function).
+static bool isPTXKernel(const Function *F) {
+  return F->getCallingConv() == CallingConv::PTX_Kernel;
+}
+
+/// For a given function F, return a '|'-separated string of the mangled names
+/// of all PTX kernel entry points that (transitively) call F.
+///
+/// If F itself is a PTX kernel, returns F's own name.
+/// If F is a __device__ function, BFS over the use-def call graph to find all
+/// __global__ ancestors.  The | separator is chosen because ; is already used
+/// as the CSV column delimiter in LoopCount output.
+static std::string getKernelParents(Function *F) {
+  if (isPTXKernel(F))
+    return F->getName().str();
+
+  SmallPtrSet<Function *, 8> Visited;
+  SmallVector<Function *, 8> Worklist;
+  SmallVector<std::string, 4> Parents;
+
+  Visited.insert(F);
+  Worklist.push_back(F);
+
+  while (!Worklist.empty()) {
+    Function *Curr = Worklist.pop_back_val();
+    for (User *U : Curr->users()) {
+      auto *CB = dyn_cast<CallBase>(U);
+      if (!CB)
+        continue;
+      Function *Caller = CB->getFunction();
+      if (!Caller || !Visited.insert(Caller).second)
+        continue;
+      if (isPTXKernel(Caller))
+        Parents.push_back(Caller->getName().str());
+      else
+        Worklist.push_back(Caller);
+    }
+  }
+
+  std::string Result;
+  for (size_t i = 0; i < Parents.size(); ++i) {
+    if (i > 0)
+      Result += "|";
+    Result += Parents[i];
+  }
+  return Result;
+}
 
 LoopCountPass::LoopCountPass() {}
 
@@ -108,11 +163,9 @@ void printContainsCall(Loop &L) {
     if (containsCall)
       break;
     for (Instruction &I : *BB) {
-      if (auto *CI = dyn_cast<CallInst>(&I)) {
-        if (!CI->isIntrinsic()) {
-          containsCall = true;
-          break;
-        }
+      if (isa<CallInst>(I) && !isa<IntrinsicInst>(I)) {
+        containsCall = true;
+        break;
       }
     }
   }
@@ -199,7 +252,9 @@ void printColumnHeader(int seenLoops, Module *M) {
            << "numComputeInsts;"
            << "numControlFlowInsts;"
            << "containsCall;"
-           << "numExits\n";
+           << "numExits;"
+           << "isKernelFunction;"
+           << "kernelParents\n";
   }
 }
 
@@ -242,6 +297,8 @@ static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
   printInstructionCounts(L);
   printContainsCall(L);
   printNumExits(L);
+  errs() << ";" << (isPTXKernel(F) ? 1 : 0);
+  errs() << ";" << getKernelParents(F);
   errs() << "\n";
 }
 
