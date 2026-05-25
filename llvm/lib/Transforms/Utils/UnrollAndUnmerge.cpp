@@ -3,6 +3,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/MemorySSA.h"
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -12,6 +13,7 @@
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/UnrollLoop.h"
 
 using namespace llvm;
 
@@ -692,6 +694,7 @@ PreservedAnalyses UnrollAndUnmergeFunctionPass::run(Function &F,
   auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
   auto &TTI = AM.getResult<TargetIRAnalysis>(F);
   auto &AC = AM.getResult<AssumptionAnalysis>(F);
+  auto &ORE = AM.getResult<OptimizationRemarkEmitterAnalysis>(F);
   bool changed = false;
 
   for (const auto &L : LI) {
@@ -707,12 +710,33 @@ PreservedAnalyses UnrollAndUnmergeFunctionPass::run(Function &F,
   while (!Worklist.empty()) {
     Loop &L = *Worklist.pop_back_val();
     auto [skip, doUnmerge, factor] = getLoopDispatch(L, &SE);
-    if (skip || !doUnmerge)
+    if (skip)
       continue;
-    std::pair<bool, Loop *> result =
-        unmerge(L, LI, DT, SE, TTI, AC, nullptr, /*checkSkip=*/false,
-                (int)factor);
-    changed |= result.first;
+
+    if (doUnmerge) {
+      // Full UU path: path-unmerge + custom unroll (original behaviour).
+      std::pair<bool, Loop *> result =
+          unmerge(L, LI, DT, SE, TTI, AC, nullptr, /*checkSkip=*/false,
+                  (int)factor);
+      changed |= result.first;
+    } else if (factor > 1) {
+      // Unroll-only path: bypass path-unmerging, use LLVM's standard unroller.
+      // Correct action for RL agent decisions where doUnmerge=0 && factor>1.
+      LLVM_DEBUG(dbgs() << "Unroll-only loop " << (seenLoops - 1)
+                        << " factor=" << factor << "\n");
+      UnrollLoopOptions ULO;
+      ULO.Count                   = factor;
+      ULO.Force                   = true;   // agent decided — bypass profitability
+      ULO.Runtime                 = true;   // GPU loops rarely have static trip counts
+      ULO.AllowExpensiveTripCount = true;
+      ULO.UnrollRemainder         = false;
+      ULO.ForgetAllSCEV           = false;
+      ULO.SCEVExpansionBudget     = 4;      // conservative; matches LLVM default
+      LoopUnrollResult res = UnrollLoop(&L, ULO, &LI, &SE, &DT, &AC, &TTI,
+                                        &ORE, /*PreserveLCSSA=*/true);
+      changed |= (res != LoopUnrollResult::Unmodified);
+    }
+    // doUnmerge=0, factor=1 → no-op; matches Python fast-path in environment.py
   }
 
   if (!changed) {
