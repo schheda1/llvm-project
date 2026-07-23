@@ -20,6 +20,7 @@
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/CtxProfAnalysis.h"
 #include "llvm/Analysis/GlobalsModRef.h"
+#include "llvm/Analysis/IR2Vec.h"
 #include "llvm/Analysis/InlineAdvisor.h"
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/ScopedNoAliasAA.h"
@@ -2392,6 +2393,12 @@ void PassBuilder::addForceUnroll(ModulePassManager &MPM,
 
 void PassBuilder::addLoopCount(ModulePassManager &MPM) {
   if (EnableLoopCount) {
+    // Compute the IR2Vec vocabulary once at module scope so the function pass
+    // can read it via the proxy (a function pass cannot run a module analysis,
+    // only read a cached one).  Requires --ir2vec-vocab-path; a missing path
+    // fails the compile loudly at IR2VecVocabAnalysis rather than silently
+    // producing zero embeddings.
+    MPM.addPass(RequireAnalysisPass<IR2VecVocabAnalysis, Module>());
     MPM.addPass(createModuleToFunctionPassAdaptor(LoopCountFunctionPass()));
   }
 }

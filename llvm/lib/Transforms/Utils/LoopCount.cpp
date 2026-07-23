@@ -4,6 +4,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CodeMetrics.h"
+#include "llvm/Analysis/IR2Vec.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
@@ -12,7 +13,9 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include <cmath>
@@ -21,6 +24,10 @@ using namespace llvm;
 
 int LoopCountPass::seenLoops = 0;
 int LoopCountFunctionPass::seenLoopsFunction = 0;
+
+// Dimensionality of the IR2Vec loop-content embedding appended to each CSV row.
+// Must match seedEmbeddingVocab75D.json and IR2VEC_DIM in hecbench.py.
+static constexpr unsigned IR2VecDim = 75;
 
 // ---------------------------------------------------------------------------
 // Kernel parent tracking
@@ -254,7 +261,13 @@ void printColumnHeader(int seenLoops, Module *M) {
            << "containsCall;"
            << "numExits;"
            << "isKernelFunction;"
-           << "kernelParents\n";
+           << "kernelParents";
+    // IR2Vec loop-content embedding columns, appended at the END so the
+    // structural feature positions (and the RL trip-count mask indices) never
+    // move.  See design decision 2 in ir2vec_plan.md.
+    for (unsigned I = 0; I < IR2VecDim; ++I)
+      errs() << ";emb" << I;
+    errs() << "\n";
   }
 }
 
@@ -274,9 +287,51 @@ void printNumberOfPaths(Loop &L, LoopInfo &LI) {
   errs() << getNumPaths(L, LI) << ";";
 }
 
+/// Emit the IR2Vec loop-content embedding (75 ';'-prefixed columns).
+///
+/// The loop embedding is the *per-instruction mean* of IR2Vec's Symbolic
+/// instruction vectors over the loop's blocks: a content signature (opcode /
+/// type / operand mix) that is deliberately size-invariant, since loop size /
+/// depth / shape are already carried by the structural features.
+///
+/// getBBVector(BB) returns the SUM of the block's instruction vectors, counting
+/// only instructionsWithoutDebug() (see SymbolicEmbedder::computeEmbeddings).
+/// The denominator MUST count the same non-debug instructions, or the mean is
+/// skewed by debug/pseudo instructions the numerator never included.
+///
+/// L.blocks() includes nested child-loop blocks — consistent with how loopSize
+/// and containsChildLoops already treat nesting.  Preheader/exit blocks are
+/// excluded (loop body only).
+///
+/// Emb == nullptr is the defensive zero-fallback (vocabulary not cached): 75
+/// zeros keep the CSV width invariant.  In the real pipeline the vocab is
+/// always present — a missing --ir2vec-vocab-path fails the compile loudly at
+/// IR2VecVocabAnalysis (and Python refuses to launch without it), so all-zero
+/// embeddings never silently reach training.
+static void printLoopEmbedding(Loop &L, const ir2vec::Embedder *Emb) {
+  if (!Emb) {
+    for (unsigned I = 0; I < IR2VecDim; ++I)
+      errs() << ";0.000000";
+    return;
+  }
+  ir2vec::Embedding Sum(IR2VecDim, 0.0);
+  unsigned NumInsts = 0;
+  for (BasicBlock *BB : L.blocks()) {
+    Sum += Emb->getBBVector(*BB);
+    for (const Instruction &I : BB->instructionsWithoutDebug()) {
+      (void)I;
+      ++NumInsts;
+    }
+  }
+  double Scale = 1.0 / (NumInsts ? NumInsts : 1u);
+  for (unsigned I = 0; I < IR2VecDim; ++I)
+    errs() << ";" << format("%.6f", Sum[I] * Scale);
+}
+
 static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
                           TargetTransformInfo &TTI, int &seenLoops,
-                          LoopInfo &LI, ScalarEvolution &SE) {
+                          LoopInfo &LI, ScalarEvolution &SE,
+                          const ir2vec::Embedder *Emb = nullptr) {
   printColumnHeader(seenLoops, M);
   errs() << "LOOPCOUNT::";
   errs() << seenLoops++ << ";";
@@ -299,6 +354,7 @@ static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
   printNumExits(L);
   errs() << ";" << (isPTXKernel(F) ? 1 : 0);
   errs() << ";" << getKernelParents(F);
+  printLoopEmbedding(L, Emb);
   errs() << "\n";
 }
 
@@ -307,6 +363,9 @@ PreservedAnalyses LoopCountPass::run(Loop &L, LoopAnalysisManager &AM,
                                      LPMUpdater &U) {
   Function *F = L.getHeader()->getParent();
   Module *M = F->getParent();
+  // Legacy loop-pass variant — NOT part of the RL pipeline (which uses
+  // LoopCountFunctionPass).  No embedder available here, so embeddings are
+  // zeros.  Kept only for the standalone -loopcount loop-pass entry point.
   printLoopData(L, M, F, AR.AC, AR.TTI, seenLoops, AR.LI, AR.SE);
   return PreservedAnalyses::all();
 }
@@ -318,6 +377,26 @@ PreservedAnalyses LoopCountFunctionPass::run(Function &F,
   auto &TTI = FAM.getResult<TargetIRAnalysis>(F);
   auto &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
   auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+
+  // Fetch the IR2Vec vocabulary cached at module scope by the
+  // RequireAnalysisPass<IR2VecVocabAnalysis> added in PassBuilder::addLoopCount.
+  // A function pass can only see *cached* module analyses via the proxy — it
+  // cannot run one.  If the require pass is absent (e.g. a pipeline that does
+  // not add it) the pointer is null and embeddings fall back to zeros.
+  auto &MAMProxy = FAM.getResult<ModuleAnalysisManagerFunctionProxy>(F);
+  const ir2vec::Vocabulary *Vocab =
+      MAMProxy.getCachedResult<IR2VecVocabAnalysis>(*F.getParent());
+
+  std::unique_ptr<ir2vec::Embedder> Emb;
+  if (Vocab && Vocab->isValid() && Vocab->getDimension() == IR2VecDim) {
+    Emb = ir2vec::Embedder::create(IR2VecKind::Symbolic, F, *Vocab);
+  } else {
+    // One warning per module, not per function.
+    static SmallPtrSet<const Module *, 4> Warned;
+    if (Warned.insert(F.getParent()).second)
+      errs() << "LOOPCOUNT WARNING: ir2vec vocab unavailable "
+                "(dim mismatch or not cached) — embeddings are zero\n";
+  }
 
   bool changed = false;
 
@@ -333,7 +412,8 @@ PreservedAnalyses LoopCountFunctionPass::run(Function &F,
 
   while (!Worklist.empty()) {
     Loop &L = *Worklist.pop_back_val();
-    printLoopData(L, F.getParent(), &F, AC, TTI, seenLoopsFunction, LI, SE);
+    printLoopData(L, F.getParent(), &F, AC, TTI, seenLoopsFunction, LI, SE,
+                  Emb.get());
   }
 
   if (changed) {
