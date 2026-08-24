@@ -19,6 +19,7 @@
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include <cmath>
+#include <utility>
 
 using namespace llvm;
 
@@ -28,6 +29,38 @@ int LoopCountFunctionPass::seenLoopsFunction = 0;
 // Dimensionality of the IR2Vec loop-content embedding appended to each CSV row.
 // Must match seedEmbeddingVocab75D.json and IR2VEC_DIM in hecbench.py.
 static constexpr unsigned IR2VecDim = 75;
+
+// ---------------------------------------------------------------------------
+// Flow-aware (FA) IR2Vec embedding — OFF by default.
+//
+// With -loopcount-emit-fa set, LoopCount appends a SECOND 75-wide embedding
+// block ("femb0".."femb74") AFTER the symbolic "emb" columns. The symbolic
+// block is left byte-identical, and with the flag OFF the output (and every
+// existing consumer, including hecbench.py) is completely unchanged. FA is a
+// pure-analysis/compile-time addition; it does not affect execute/measure.
+// See followup_plan.md §1f.
+// ---------------------------------------------------------------------------
+static cl::opt<bool> EmitFAEmbedding(
+    "loopcount-emit-fa", cl::init(false), cl::Hidden,
+    cl::desc("Append flow-aware IR2Vec embedding columns (femb0..) after the "
+             "symbolic emb columns. Off by default: output stays byte-identical."));
+
+static cl::opt<unsigned> FAIterations(
+    "loopcount-fa-iters", cl::init(5u), cl::Hidden,
+    cl::desc("Flow-aware propagation iterations. A FIXED count (not an epsilon "
+             "stop) so the result is deterministic across builds/ISAs; choose it "
+             "from an offline epsilon-convergence sweep."));
+
+static cl::opt<float> FAOpcWeight(
+    "loopcount-fa-opc-weight", cl::init(1.0f), cl::Hidden,
+    cl::desc("Flow-aware opcode weight Wo."));
+static cl::opt<float> FATypeWeight(
+    "loopcount-fa-type-weight", cl::init(0.5f), cl::Hidden,
+    cl::desc("Flow-aware type weight Wt."));
+static cl::opt<float> FAArgWeight(
+    "loopcount-fa-arg-weight", cl::init(0.2f), cl::Hidden,
+    cl::desc("Flow-aware operand weight Wa. Keep < 1 so the fixed point stays "
+             "bounded (deeper def-use contributions decay geometrically)."));
 
 // ---------------------------------------------------------------------------
 // Kernel parent tracking
@@ -267,6 +300,11 @@ void printColumnHeader(int seenLoops, Module *M) {
     // move.  See design decision 2 in ir2vec_plan.md.
     for (unsigned I = 0; I < IR2VecDim; ++I)
       errs() << ";emb" << I;
+    // Flow-aware columns, only when enabled, appended AFTER the symbolic block
+    // so the symbolic emb positions (and the RL feature indices) never move.
+    if (EmitFAEmbedding)
+      for (unsigned I = 0; I < IR2VecDim; ++I)
+        errs() << ";femb" << I;
     errs() << "\n";
   }
 }
@@ -328,10 +366,109 @@ static void printLoopEmbedding(Loop &L, const ir2vec::Embedder *Emb) {
     errs() << ";" << format("%.6f", Sum[I] * Scale);
 }
 
+/// Compute flow-aware (FA) IR2Vec per-instruction embeddings for the whole
+/// function F.
+///
+/// FA extends the symbolic per-instruction vector by replacing an operand's
+/// KIND-seed with the (previous-round) embedding of the instruction that
+/// DEFINES it, propagating data-flow along def-use chains. Non-instruction
+/// operands (arguments, constants, globals, block labels) keep their kind-seed,
+/// exactly as the symbolic embedder treats them — so FA follows register/SSA
+/// flow only, never memory flow.
+///
+/// Cyclic def-use (PHIs / loop back-edges) is handled by a FIXED number of
+/// Jacobi iterations (FAIterations): each round reads ONLY the previous round's
+/// map, so the result is independent of map/traversal order and therefore
+/// deterministic across builds and ISAs. Wa (< 1) decays the backward slice so
+/// the values stay bounded. Mirrors the intended ir2vec::FlowAwareEmbedder, kept
+/// local to this pass so the shared IR2Vec analysis (and its Symbolic output) is
+/// left untouched.
+static ir2vec::InstEmbeddingsMap
+computeFlowAwareEmbeddings(const Function &F, const ir2vec::Vocabulary &Vocab) {
+  const unsigned Dim = Vocab.getDimension();
+
+  // The constant opcode+type part of an instruction's vector (never changes
+  // across iterations).
+  auto opTypeBase = [&](const Instruction &I) {
+    ir2vec::Embedding B(Dim, 0.0);
+    B.scaleAndAdd(Vocab[I.getOpcode()], FAOpcWeight);
+    B.scaleAndAdd(Vocab[I.getType()->getTypeID()], FATypeWeight);
+    return B;
+  };
+
+  // Round 0: the symbolic value — every operand contributes its kind-seed.
+  ir2vec::InstEmbeddingsMap Cur;
+  for (const BasicBlock &BB : F)
+    for (const Instruction &I : BB.instructionsWithoutDebug()) {
+      ir2vec::Embedding Args(Dim, 0.0);
+      for (const Use &U : I.operands())
+        Args += Vocab[U.get()];
+      ir2vec::Embedding E = opTypeBase(I);
+      E.scaleAndAdd(Args, FAArgWeight);
+      Cur[&I] = std::move(E);
+    }
+
+  // Jacobi fixed-point: an instruction operand now contributes the DEFINING
+  // instruction's previous-round vector; every other operand keeps its seed.
+  for (unsigned Round = 0; Round < FAIterations; ++Round) {
+    ir2vec::InstEmbeddingsMap Nxt;
+    Nxt.reserve(Cur.size());
+    for (const BasicBlock &BB : F)
+      for (const Instruction &I : BB.instructionsWithoutDebug()) {
+        ir2vec::Embedding Args(Dim, 0.0);
+        for (const Use &U : I.operands()) {
+          const Value *V = U.get();
+          if (const auto *DefI = dyn_cast<Instruction>(V)) {
+            auto Found = Cur.find(DefI);
+            if (Found != Cur.end()) {
+              Args += Found->second;
+              continue;
+            }
+          }
+          Args += Vocab[V];
+        }
+        ir2vec::Embedding E = opTypeBase(I);
+        E.scaleAndAdd(Args, FAArgWeight);
+        Nxt[&I] = std::move(E);
+      }
+    Cur = std::move(Nxt);
+  }
+
+  return Cur;
+}
+
+/// Emit the flow-aware IR2Vec embedding (75 ';'-prefixed femb columns): the
+/// per-instruction mean of FA vectors over the loop's blocks — exactly parallel
+/// to printLoopEmbedding for the symbolic vectors, using the same non-debug
+/// instruction set as its denominator. An absent/empty map yields 75 zeros,
+/// mirroring the symbolic zero-fallback so the CSV width is invariant.
+static void printLoopFAEmbedding(Loop &L,
+                                 const ir2vec::InstEmbeddingsMap *FAMap) {
+  if (!FAMap || FAMap->empty()) {
+    for (unsigned I = 0; I < IR2VecDim; ++I)
+      errs() << ";0.000000";
+    return;
+  }
+  ir2vec::Embedding Sum(IR2VecDim, 0.0);
+  unsigned NumInsts = 0;
+  for (BasicBlock *BB : L.blocks()) {
+    for (const Instruction &I : BB->instructionsWithoutDebug()) {
+      auto It = FAMap->find(&I);
+      if (It != FAMap->end())
+        Sum += It->second;
+      ++NumInsts;
+    }
+  }
+  double Scale = 1.0 / (NumInsts ? NumInsts : 1u);
+  for (unsigned I = 0; I < IR2VecDim; ++I)
+    errs() << ";" << format("%.6f", Sum[I] * Scale);
+}
+
 static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
                           TargetTransformInfo &TTI, int &seenLoops,
                           LoopInfo &LI, ScalarEvolution &SE,
-                          const ir2vec::Embedder *Emb = nullptr) {
+                          const ir2vec::Embedder *Emb = nullptr,
+                          const ir2vec::InstEmbeddingsMap *FAMap = nullptr) {
   printColumnHeader(seenLoops, M);
   errs() << "LOOPCOUNT::";
   errs() << seenLoops++ << ";";
@@ -355,6 +492,8 @@ static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
   errs() << ";" << (isPTXKernel(F) ? 1 : 0);
   errs() << ";" << getKernelParents(F);
   printLoopEmbedding(L, Emb);
+  if (EmitFAEmbedding)
+    printLoopFAEmbedding(L, FAMap);
   errs() << "\n";
 }
 
@@ -407,13 +546,25 @@ PreservedAnalyses LoopCountFunctionPass::run(Function &F,
     changed |= formLCSSARecursively(*L, DT, &LI, &SE);
   }
 
+  // Flow-aware embeddings: computed ONCE per function and pooled per loop.
+  // MUST be built AFTER simplifyLoop/formLCSSA canonicalize the IR — the
+  // symbolic embedder computes lazily (in the worklist loop below, i.e. also
+  // post-canonicalization), so FA must see the same instructions, or its
+  // instruction pointers predate the preheaders/LCSSA PHIs those passes insert
+  // and the two embeddings describe different IR. Only when enabled and the
+  // vocab is usable; otherwise femb falls back to zeros, like the symbolic path.
+  ir2vec::InstEmbeddingsMap FAMap;
+  if (EmitFAEmbedding && Vocab && Vocab->isValid() &&
+      Vocab->getDimension() == IR2VecDim)
+    FAMap = computeFlowAwareEmbeddings(F, *Vocab);
+
   SmallPriorityWorklist<Loop *, 4> Worklist;
   appendLoopsToWorklist(LI, Worklist);
 
   while (!Worklist.empty()) {
     Loop &L = *Worklist.pop_back_val();
     printLoopData(L, F.getParent(), &F, AC, TTI, seenLoopsFunction, LI, SE,
-                  Emb.get());
+                  Emb.get(), EmitFAEmbedding ? &FAMap : nullptr);
   }
 
   if (changed) {
