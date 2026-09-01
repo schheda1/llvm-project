@@ -63,6 +63,26 @@ static cl::opt<float> FAArgWeight(
              "bounded (deeper def-use contributions decay geometrically)."));
 
 // ---------------------------------------------------------------------------
+// Kernel-context (KEMB) IR2Vec embedding — OFF by default.
+//
+// With -loopcount-emit-kernel-emb set, LoopCount appends a THIRD 75-wide block
+// ("kemb0".."kemb74") AFTER the symbolic emb (and, if enabled, the flow-aware
+// femb) columns. kemb is the whole-*kernel* symbolic pool: every loop in a
+// __global__ kernel shares that kernel's function-wide content signature, and a
+// loop in a __device__ function gets the mean pool of the kernel(s) that call it
+// (the same parent set the kernelParents column reports). It marks kernel
+// membership/context WITHOUT using kernel identity (name) as a feature — it is a
+// content embedding, not an id. SYM base: kernel context is a flow-blind content
+// signature; FA is the loop-local refinement. Off by default => output stays
+// byte-identical. Independent of -loopcount-emit-fa. See followup_plan.md §1e/§1f.
+// ---------------------------------------------------------------------------
+static cl::opt<bool> EmitKernelEmbedding(
+    "loopcount-emit-kernel-emb", cl::init(false), cl::Hidden,
+    cl::desc("Append a per-kernel IR2Vec context embedding (kemb0..) after the "
+             "symbolic emb (and flow-aware femb) columns. Off by default: output "
+             "stays byte-identical."));
+
+// ---------------------------------------------------------------------------
 // Kernel parent tracking
 // ---------------------------------------------------------------------------
 
@@ -71,20 +91,25 @@ static bool isPTXKernel(const Function *F) {
   return F->getCallingConv() == CallingConv::PTX_Kernel;
 }
 
-/// For a given function F, return a '|'-separated string of the mangled names
-/// of all PTX kernel entry points that (transitively) call F.
+/// For a given function F, return the PTX kernel entry points (__global__
+/// functions) it belongs to.
 ///
-/// If F itself is a PTX kernel, returns F's own name.
+/// If F itself is a PTX kernel, returns just F.
 /// If F is a __device__ function, BFS over the use-def call graph to find all
-/// __global__ ancestors.  The | separator is chosen because ; is already used
-/// as the CSV column delimiter in LoopCount output.
-static std::string getKernelParents(Function *F) {
-  if (isPTXKernel(F))
-    return F->getName().str();
+/// __global__ ancestors, in discovery order.
+///
+/// Single source of truth for BOTH the kernelParents CSV column and the
+/// kernel-context embedding (kemb), so the two can never disagree about which
+/// kernel(s) a loop belongs to.
+static SmallVector<Function *, 4> collectKernelParents(Function *F) {
+  SmallVector<Function *, 4> Parents;
+  if (isPTXKernel(F)) {
+    Parents.push_back(F);
+    return Parents;
+  }
 
   SmallPtrSet<Function *, 8> Visited;
   SmallVector<Function *, 8> Worklist;
-  SmallVector<std::string, 4> Parents;
 
   Visited.insert(F);
   Worklist.push_back(F);
@@ -99,17 +124,25 @@ static std::string getKernelParents(Function *F) {
       if (!Caller || !Visited.insert(Caller).second)
         continue;
       if (isPTXKernel(Caller))
-        Parents.push_back(Caller->getName().str());
+        Parents.push_back(Caller);
       else
         Worklist.push_back(Caller);
     }
   }
+  return Parents;
+}
 
+/// A '|'-separated string of the mangled names of F's PTX kernel parents (see
+/// collectKernelParents).  The | separator is chosen because ; is already the
+/// CSV column delimiter in LoopCount output.  Output is byte-identical to the
+/// pre-refactor inline BFS: same parent set, same discovery order.
+static std::string getKernelParents(Function *F) {
+  SmallVector<Function *, 4> Parents = collectKernelParents(F);
   std::string Result;
   for (size_t i = 0; i < Parents.size(); ++i) {
     if (i > 0)
       Result += "|";
-    Result += Parents[i];
+    Result += Parents[i]->getName().str();
   }
   return Result;
 }
@@ -305,6 +338,11 @@ void printColumnHeader(int seenLoops, Module *M) {
     if (EmitFAEmbedding)
       for (unsigned I = 0; I < IR2VecDim; ++I)
         errs() << ";femb" << I;
+    // Kernel-context columns, only when enabled, appended AFTER emb and femb so
+    // all earlier feature positions stay fixed.  Independent of the FA flag.
+    if (EmitKernelEmbedding)
+      for (unsigned I = 0; I < IR2VecDim; ++I)
+        errs() << ";kemb" << I;
     errs() << "\n";
   }
 }
@@ -464,11 +502,58 @@ static void printLoopFAEmbedding(Loop &L,
     errs() << ";" << format("%.6f", Sum[I] * Scale);
 }
 
+/// Symbolic IR2Vec pool over an ENTIRE function K (mean of K's per-instruction
+/// vectors) — the whole-kernel content signature used for kemb. Parallel to
+/// printLoopEmbedding but scoped to the full function instead of one loop, and
+/// returning the vector instead of printing it. If ReuseEmb is non-null it is
+/// K's own embedder (the common case, K == the function being processed); else a
+/// throwaway symbolic embedder is created for K (used when K is a __global__
+/// caller of the __device__ function currently under the pass).
+static ir2vec::Embedding
+poolFunctionEmbedding(Function &K, const ir2vec::Vocabulary &Vocab,
+                      const ir2vec::Embedder *ReuseEmb) {
+  std::unique_ptr<ir2vec::Embedder> Local;
+  const ir2vec::Embedder *E = ReuseEmb;
+  if (!E) {
+    Local = ir2vec::Embedder::create(IR2VecKind::Symbolic, K, Vocab);
+    E = Local.get();
+  }
+  ir2vec::Embedding Sum(IR2VecDim, 0.0);
+  unsigned NumInsts = 0;
+  for (const BasicBlock &BB : K) {
+    Sum += E->getBBVector(BB);
+    for (const Instruction &I : BB.instructionsWithoutDebug()) {
+      (void)I;
+      ++NumInsts;
+    }
+  }
+  double Scale = 1.0 / (NumInsts ? NumInsts : 1u);
+  ir2vec::Embedding Out(IR2VecDim, 0.0);
+  for (unsigned I = 0; I < IR2VecDim; ++I)
+    Out[I] = Sum[I] * Scale;
+  return Out;
+}
+
+/// Emit the kernel-context embedding (75 ';'-prefixed kemb columns): the
+/// pre-computed per-kernel pool shared by every loop in the function.  A
+/// null/empty vector yields 75 zeros (vocab unavailable or no kernel ancestor),
+/// mirroring the symbolic/FA zero-fallback so the CSV width is invariant.
+static void printKernelEmbedding(const ir2vec::Embedding *KEmb) {
+  if (!KEmb || KEmb->size() != IR2VecDim) {
+    for (unsigned I = 0; I < IR2VecDim; ++I)
+      errs() << ";0.000000";
+    return;
+  }
+  for (unsigned I = 0; I < IR2VecDim; ++I)
+    errs() << ";" << format("%.6f", (*KEmb)[I]);
+}
+
 static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
                           TargetTransformInfo &TTI, int &seenLoops,
                           LoopInfo &LI, ScalarEvolution &SE,
                           const ir2vec::Embedder *Emb = nullptr,
-                          const ir2vec::InstEmbeddingsMap *FAMap = nullptr) {
+                          const ir2vec::InstEmbeddingsMap *FAMap = nullptr,
+                          const ir2vec::Embedding *KernelEmb = nullptr) {
   printColumnHeader(seenLoops, M);
   errs() << "LOOPCOUNT::";
   errs() << seenLoops++ << ";";
@@ -494,6 +579,8 @@ static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
   printLoopEmbedding(L, Emb);
   if (EmitFAEmbedding)
     printLoopFAEmbedding(L, FAMap);
+  if (EmitKernelEmbedding)
+    printKernelEmbedding(KernelEmb);
   errs() << "\n";
 }
 
@@ -558,13 +645,47 @@ PreservedAnalyses LoopCountFunctionPass::run(Function &F,
       Vocab->getDimension() == IR2VecDim)
     FAMap = computeFlowAwareEmbeddings(F, *Vocab);
 
+  // Kernel-context embedding: ONE whole-kernel symbolic pool shared by every
+  // loop in F (kernel membership/context is a per-function property, so it is
+  // computed once here — like FAMap — and handed to each loop row). If F is a
+  // __global__ kernel, that pool is F itself (reusing Emb). If F is a __device__
+  // function, it is the mean of the pools of the kernel(s) that call it — the
+  // same parent set the kernelParents column reports. Zeros when the vocab is
+  // unavailable or F has no kernel ancestor (host loop). Computed AFTER
+  // canonicalization for the same reason FAMap is, so the F==kernel pool matches
+  // the symbolic emb the loops report; a parent kernel K != F is pooled from its
+  // current IR state (a bounded, deterministic approximation — a few
+  // preheader/LCSSA insertions out of a whole kernel, affecting device-fn loops
+  // only). SYM base: kernel context is a flow-blind content signature.
+  ir2vec::Embedding KernelEmb(IR2VecDim, 0.0);
+  bool HaveKernelEmb = false;
+  if (EmitKernelEmbedding && Vocab && Vocab->isValid() &&
+      Vocab->getDimension() == IR2VecDim) {
+    SmallVector<Function *, 4> Kernels = collectKernelParents(&F);
+    unsigned NK = 0;
+    for (Function *K : Kernels)
+      if (K && !K->isDeclaration())
+        ++NK;
+    if (NK > 0) {
+      for (Function *K : Kernels) {
+        if (!K || K->isDeclaration())
+          continue;
+        ir2vec::Embedding KP =
+            poolFunctionEmbedding(*K, *Vocab, (K == &F) ? Emb.get() : nullptr);
+        KernelEmb.scaleAndAdd(KP, 1.0f / static_cast<float>(NK));
+      }
+      HaveKernelEmb = true;
+    }
+  }
+
   SmallPriorityWorklist<Loop *, 4> Worklist;
   appendLoopsToWorklist(LI, Worklist);
 
   while (!Worklist.empty()) {
     Loop &L = *Worklist.pop_back_val();
     printLoopData(L, F.getParent(), &F, AC, TTI, seenLoopsFunction, LI, SE,
-                  Emb.get(), EmitFAEmbedding ? &FAMap : nullptr);
+                  Emb.get(), EmitFAEmbedding ? &FAMap : nullptr,
+                  HaveKernelEmb ? &KernelEmb : nullptr);
   }
 
   if (changed) {
