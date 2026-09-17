@@ -9,6 +9,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/CallingConv.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
@@ -81,6 +82,35 @@ static cl::opt<bool> EmitKernelEmbedding(
     cl::desc("Append a per-kernel IR2Vec context embedding (kemb0..) after the "
              "symbolic emb (and flow-aware femb) columns. Off by default: output "
              "stays byte-identical."));
+
+// ---------------------------------------------------------------------------
+// Type-width histogram (WIDTHS) — OFF by default.
+//
+// With -loopcount-emit-widths set, LoopCount appends a small per-loop histogram
+// over IR-level scalar type widths ("width_i1".."width_other") AFTER the emb/femb/
+// kemb columns. It exists to de-alias what the symbolic type vocabulary collapses:
+// IR2Vec has only 6 type classes (Float/Integer/Pointer/Struct/Vector/Void), so
+// float==half==bfloat16 and i32==i64 — byte width is erased, and kernels that
+// differ ONLY by element type (e.g. LayerNorm<float> vs <__half> vs <__nv_bfloat16>)
+// get identical embeddings. This is IR type CONTENT that de-aliases (a counting
+// fact), NOT a register-pressure/occupancy proxy — see followup_plan.md §1e and
+// IR2VEC_LIMITS.md. Off by default => output byte-identical. Independent of the
+// other emit flags.
+// ---------------------------------------------------------------------------
+static cl::opt<bool> EmitWidths(
+    "loopcount-emit-widths", cl::init(false), cl::Hidden,
+    cl::desc("Append a per-loop IR-level type-width histogram (width_i1..) after "
+             "the emb/femb/kemb columns. Off by default: output stays byte-identical."));
+
+// Type-width alphabet — histogram bins in FIXED column order. Declared here (before
+// printColumnHeader, which names the columns) and kept in sync with the "widths"
+// block (_WIDTH_BINS) in features.py.
+enum WidthBin {
+  W_I1, W_I8, W_I16, W_I32, W_I64, W_BF16, W_F16, W_F32, W_F64, W_PTR, W_OTHER
+};
+static constexpr unsigned NumWidthBins = W_OTHER + 1;
+static const char *const WidthBinNames[NumWidthBins] = {
+    "i1", "i8", "i16", "i32", "i64", "bf16", "f16", "f32", "f64", "ptr", "other"};
 
 // ---------------------------------------------------------------------------
 // Kernel parent tracking
@@ -343,6 +373,11 @@ void printColumnHeader(int seenLoops, Module *M) {
     if (EmitKernelEmbedding)
       for (unsigned I = 0; I < IR2VecDim; ++I)
         errs() << ";kemb" << I;
+    // Type-width histogram columns, appended AFTER emb/femb/kemb so all earlier
+    // feature positions stay fixed. Independent of the other flags.
+    if (EmitWidths)
+      for (unsigned I = 0; I < NumWidthBins; ++I)
+        errs() << ";width_" << WidthBinNames[I];
     errs() << "\n";
   }
 }
@@ -548,6 +583,60 @@ static void printKernelEmbedding(const ir2vec::Embedding *KEmb) {
     errs() << ";" << format("%.6f", (*KEmb)[I]);
 }
 
+/// Map a type to its width bin. Vector types use their scalar element (so
+/// <4 x half> counts as half). struct/array/fp128/x86_fp80/odd-int widths -> other.
+static WidthBin widthBin(Type *T) {
+  if (!T)
+    return W_OTHER;
+  if (auto *VT = dyn_cast<VectorType>(T))
+    T = VT->getElementType();
+  if (T->isPointerTy())
+    return W_PTR;
+  if (T->isIntegerTy()) {
+    switch (T->getIntegerBitWidth()) {
+    case 1:  return W_I1;
+    case 8:  return W_I8;
+    case 16: return W_I16;
+    case 32: return W_I32;
+    case 64: return W_I64;
+    default: return W_OTHER;
+    }
+  }
+  if (T->isBFloatTy())
+    return W_BF16;
+  if (T->isHalfTy())
+    return W_F16;
+  if (T->isFloatTy())
+    return W_F32;
+  if (T->isDoubleTy())
+    return W_F64;
+  return W_OTHER;
+}
+
+/// Emit the per-loop type-width histogram (NumWidthBins ';'-prefixed columns): the
+/// fraction of the loop's non-debug, non-void instruction RESULT types in each width
+/// bin.  Normalized => size-invariant, like the embeddings (structural size lives in
+/// the structural columns).  An empty loop emits zeros.  Pure type inspection — no
+/// IR2Vec vocab needed — so it is always available when the flag is set.  De-aliases
+/// element-type instantiations the symbolic type vocabulary collapses (float/half/
+/// bfloat16, i32/i64); it does NOT separate same-type-different-constant or
+/// same-width-distinct-struct instantiations (see IR2VEC_LIMITS.md).
+static void printLoopWidths(Loop &L) {
+  unsigned Hist[NumWidthBins] = {0};
+  unsigned Total = 0;
+  for (BasicBlock *BB : L.blocks())
+    for (const Instruction &I : BB->instructionsWithoutDebug()) {
+      Type *T = I.getType();
+      if (T->isVoidTy())
+        continue;
+      ++Hist[widthBin(T)];
+      ++Total;
+    }
+  double Scale = Total ? 1.0 / Total : 0.0;
+  for (unsigned I = 0; I < NumWidthBins; ++I)
+    errs() << ";" << format("%.6f", Hist[I] * Scale);
+}
+
 static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
                           TargetTransformInfo &TTI, int &seenLoops,
                           LoopInfo &LI, ScalarEvolution &SE,
@@ -581,6 +670,8 @@ static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
     printLoopFAEmbedding(L, FAMap);
   if (EmitKernelEmbedding)
     printKernelEmbedding(KernelEmb);
+  if (EmitWidths)
+    printLoopWidths(L);
   errs() << "\n";
 }
 
