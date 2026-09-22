@@ -25,14 +25,17 @@
 #include "llvm/Analysis/ProfileSummaryInfo.h"
 #include "llvm/Analysis/ScopedNoAliasAA.h"
 #include "llvm/Analysis/TypeBasedAliasAnalysis.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Pass.h"
 #include "llvm/Passes/OptimizationLevel.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/PGOOptions.h"
 #include "llvm/Support/VirtualFileSystem.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/AggressiveInstCombine/AggressiveInstCombine.h"
 #include "llvm/Transforms/Coroutines/CoroAnnotationElide.h"
@@ -200,6 +203,13 @@ static cl::opt<bool> EnableUU("enable-uu", cl::init(false),
                               cl::desc("Enable Unroll & Unmerge Pass."));
 static cl::opt<bool> EnableLoopCount("enable-loopcount", cl::init(false),
                                      cl::desc("Enable LoopCountPass."));
+static cl::opt<std::string> LoopCountEmitIR(
+    "loopcount-emit-ir", cl::init(""),
+    cl::desc("If non-empty, write the module to this path right after LoopCount "
+             "runs — the early, stamped IR (see -loopcount-stamp-loops) a graph "
+             "builder consumes, aligned with the CSV loopIdx and NOT the "
+             "fully-optimized IR. Use with --cuda-device-only so a single cc1 "
+             "writes one file."));
 static cl::opt<bool>
     EnableForceUnroll("enable-unroll", cl::init(false),
                       cl::desc("Force enables LoopUnrollPass."));
@@ -2391,6 +2401,27 @@ void PassBuilder::addForceUnroll(ModulePassManager &MPM,
   }
 }
 
+namespace {
+// Writes the current module to the -loopcount-emit-ir path, if set. Added right
+// after LoopCount so the dumped IR is the EARLY, stamped IR the CSV features
+// describe — before the rest of the -O3 pipeline mutates loops/instructions.
+struct LoopCountEmitIRPass : PassInfoMixin<LoopCountEmitIRPass> {
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    const std::string Path = LoopCountEmitIR;
+    if (!Path.empty()) {
+      std::error_code EC;
+      raw_fd_ostream OS(Path, EC, sys::fs::OF_Text);
+      if (!EC)
+        M.print(OS, /*AAW=*/nullptr);
+      else
+        errs() << "LOOPCOUNT WARNING: cannot open -loopcount-emit-ir file '"
+               << Path << "': " << EC.message() << "\n";
+    }
+    return PreservedAnalyses::all();
+  }
+};
+} // namespace
+
 void PassBuilder::addLoopCount(ModulePassManager &MPM) {
   if (EnableLoopCount) {
     // Compute the IR2Vec vocabulary once at module scope so the function pass
@@ -2400,6 +2431,10 @@ void PassBuilder::addLoopCount(ModulePassManager &MPM) {
     // producing zero embeddings.
     MPM.addPass(RequireAnalysisPass<IR2VecVocabAnalysis, Module>());
     MPM.addPass(createModuleToFunctionPassAdaptor(LoopCountFunctionPass()));
+    // Dump the early, stamped IR (if -loopcount-emit-ir is set) BEFORE later
+    // optimization passes mutate it, so a graph built from it matches the
+    // loopIdx / emb / femb the CSV just reported.
+    MPM.addPass(LoopCountEmitIRPass());
   }
 }
 

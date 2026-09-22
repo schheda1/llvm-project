@@ -9,10 +9,12 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/CallingConv.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/CommandLine.h"
@@ -101,6 +103,28 @@ static cl::opt<bool> EmitWidths(
     "loopcount-emit-widths", cl::init(false), cl::Hidden,
     cl::desc("Append a per-loop IR-level type-width histogram (width_i1..) after "
              "the emb/femb/kemb columns. Off by default: output stays byte-identical."));
+
+// ---------------------------------------------------------------------------
+// Loop-membership stamping (for the ProGraML per-loop slicing) — OFF by default.
+//
+// With -loopcount-stamp-loops set, each non-debug instruction in a loop's body
+// blocks is tagged with !loopcount.loops metadata: the SET of loopIdx values of
+// every loop that contains it (its own loop plus all enclosing outer loops). The
+// loopIdx is the SAME
+// running counter the CSV emits (seenLoops), so a downstream graph builder can
+// slice a per-loop subgraph keyed by the identical loopIdx the rewards key on.
+// Scope is exactly L.blocks() x instructionsWithoutDebug() — identical to the
+// emb/femb pooling scope — so the sliced subgraph covers the same instructions
+// IR2Vec embeds (apples-to-apples). Off by default => no metadata is added and
+// the CSV output is byte-identical. Pairs with -loopcount-emit-ir, which dumps
+// the stamped module right after this pass runs (before later opt passes mutate
+// it). See followup_plan.md (ProGraML per-loop mapping).
+// ---------------------------------------------------------------------------
+static cl::opt<bool> StampLoops(
+    "loopcount-stamp-loops", cl::init(false), cl::Hidden,
+    cl::desc("Stamp each in-loop instruction with !loopcount.loops metadata (the "
+             "set of enclosing loopIdx). Off by default: no metadata, output "
+             "byte-identical. Meant to be dumped via -loopcount-emit-ir."));
 
 // Type-width alphabet — histogram bins in FIXED column order. Declared here (before
 // printColumnHeader, which names the columns) and kept in sync with the "widths"
@@ -637,6 +661,29 @@ static void printLoopWidths(Loop &L) {
     errs() << ";" << format("%.6f", Hist[I] * Scale);
 }
 
+// Stamp every non-debug instruction in L's body blocks with L's loopIdx, as an
+// entry in the instruction's !loopcount.loops metadata. ACCUMULATES: because an
+// outer loop's L.blocks() includes its subloops' blocks, a nested instruction is
+// visited once per enclosing loop, so its metadata ends up the SET {outer, inner}
+// (order-independent). The scope (L.blocks() x instructionsWithoutDebug()) is the
+// same one emb/femb pool over, so a consumer slicing on this metadata selects the
+// exact instruction set IR2Vec embeds. loopIdx is the value the CSV row carries.
+static void stampLoopInstructions(Loop &L, int loopIdx) {
+  LLVMContext &Ctx = L.getHeader()->getContext();
+  Metadata *IdxMD =
+      ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(Ctx), loopIdx));
+  for (BasicBlock *BB : L.blocks()) {
+    for (Instruction &I : BB->instructionsWithoutDebug()) {
+      SmallVector<Metadata *, 4> Elts;
+      if (MDNode *Existing = I.getMetadata("loopcount.loops"))
+        for (const MDOperand &Op : Existing->operands())
+          Elts.push_back(Op.get());
+      Elts.push_back(IdxMD);
+      I.setMetadata("loopcount.loops", MDNode::get(Ctx, Elts));
+    }
+  }
+}
+
 static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
                           TargetTransformInfo &TTI, int &seenLoops,
                           LoopInfo &LI, ScalarEvolution &SE,
@@ -644,6 +691,9 @@ static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
                           const ir2vec::InstEmbeddingsMap *FAMap = nullptr,
                           const ir2vec::Embedding *KernelEmb = nullptr) {
   printColumnHeader(seenLoops, M);
+  // Capture the loopIdx BEFORE the post-increment so stamping (below) uses the
+  // exact value this CSV row carries.
+  const int thisLoopIdx = seenLoops;
   errs() << "LOOPCOUNT::";
   errs() << seenLoops++ << ";";
   errs() << L.getLoopDepth() << ";";
@@ -673,6 +723,12 @@ static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
   if (EmitWidths)
     printLoopWidths(L);
   errs() << "\n";
+
+  // Stamp loop membership onto the instructions (independent of the CSV above).
+  // Uses this row's loopIdx so a graph builder can slice the per-loop subgraph
+  // keyed by the same value. Off unless -loopcount-stamp-loops.
+  if (StampLoops)
+    stampLoopInstructions(L, thisLoopIdx);
 }
 
 PreservedAnalyses LoopCountPass::run(Loop &L, LoopAnalysisManager &AM,
