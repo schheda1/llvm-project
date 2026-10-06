@@ -867,8 +867,14 @@ void getLoopsToUnrollAndUnmerge(SmallPriorityWorklist<Loop *, 4> &Worklist,
 
 PreservedAnalyses UnrollAndUnmergeHeuristic::run(Function &F,
                                                 FunctionAnalysisManager &AM) {
-  bool targetIsNVPTX = Triple(F.getParent()->getTargetTriple()).isNVPTX();
-  if (!targetIsNVPTX) {
+  // The published UU heuristic was authored for NVPTX; allow it on AMDGPU too so
+  // the cross-architecture study can reproduce the "doing nothing beats the
+  // published heuristic" baseline on AMD.  The empirically-chosen size threshold
+  // (estimatedLoopSize > 1024 in canUnrollAndUnmerge) is deliberately left at its
+  // NVPTX-tuned value — re-tuning it for AMD is a separate, measured effort.
+  Triple TT(F.getParent()->getTargetTriple());
+  bool targetIsGPU = TT.isNVPTX() || TT.isAMDGCN();
+  if (!targetIsGPU) {
     return PreservedAnalyses::all();
   }
   LLVM_DEBUG(dbgs() << "=== Start Unroll & Unmerge Heuristic Pass ===\n");

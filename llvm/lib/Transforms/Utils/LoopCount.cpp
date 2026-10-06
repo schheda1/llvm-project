@@ -140,13 +140,22 @@ static const char *const WidthBinNames[NumWidthBins] = {
 // Kernel parent tracking
 // ---------------------------------------------------------------------------
 
-/// Return true if F is a PTX kernel entry point (__global__ function).
-static bool isPTXKernel(const Function *F) {
-  return F->getCallingConv() == CallingConv::PTX_Kernel;
+/// Return true if F is a GPU kernel entry point (__global__ function) on either
+/// supported target: CUDA/NVPTX (PTX_Kernel) or HIP/AMDGPU (AMDGPU_KERNEL).
+///
+/// This is load-bearing, not a guard: it gates device-loop eligibility, the
+/// kernelParents column, and the kernel-context (kemb) embedding.  Recognising
+/// only one calling convention makes every loop on the other architecture look
+/// like a host loop, so the whole feature pipeline extracts nothing there.  A
+/// function has exactly one calling convention and PTX_Kernel/AMDGPU_KERNEL are
+/// mutually exclusive per target, so accepting both is byte-identical on each.
+static bool isGPUKernel(const Function *F) {
+  CallingConv::ID CC = F->getCallingConv();
+  return CC == CallingConv::PTX_Kernel || CC == CallingConv::AMDGPU_KERNEL;
 }
 
-/// For a given function F, return the PTX kernel entry points (__global__
-/// functions) it belongs to.
+/// For a given function F, return the GPU kernel entry points (__global__
+/// functions, NVPTX or AMDGPU) it belongs to.
 ///
 /// If F itself is a PTX kernel, returns just F.
 /// If F is a __device__ function, BFS over the use-def call graph to find all
@@ -157,7 +166,7 @@ static bool isPTXKernel(const Function *F) {
 /// kernel(s) a loop belongs to.
 static SmallVector<Function *, 4> collectKernelParents(Function *F) {
   SmallVector<Function *, 4> Parents;
-  if (isPTXKernel(F)) {
+  if (isGPUKernel(F)) {
     Parents.push_back(F);
     return Parents;
   }
@@ -177,7 +186,7 @@ static SmallVector<Function *, 4> collectKernelParents(Function *F) {
       Function *Caller = CB->getFunction();
       if (!Caller || !Visited.insert(Caller).second)
         continue;
-      if (isPTXKernel(Caller))
+      if (isGPUKernel(Caller))
         Parents.push_back(Caller);
       else
         Worklist.push_back(Caller);
@@ -713,7 +722,7 @@ static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
   printInstructionCounts(L);
   printContainsCall(L);
   printNumExits(L);
-  errs() << ";" << (isPTXKernel(F) ? 1 : 0);
+  errs() << ";" << (isGPUKernel(F) ? 1 : 0);
   errs() << ";" << getKernelParents(F);
   printLoopEmbedding(L, Emb);
   if (EmitFAEmbedding)
