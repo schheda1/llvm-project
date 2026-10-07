@@ -6,6 +6,7 @@
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -21,6 +22,25 @@ using namespace llvm;
 
 static int seenLoops = 0;
 int UnrollAndUnmergeHeuristic::seenLoopsHeuristic = 0;
+
+// Runtime unrolling needs a remainder loop, which LLVM refuses to build (and
+// ASSERTS on — LoopUnroll.cpp canHaveUnrollRemainder) when the loop contains an
+// uncontrolled convergent operation.  AMDGPU marks device calls `convergent` by
+// default, so such loops are common there, and the pipeline's own
+// containsConvergent() under-detects them: it recurses into the callee's body
+// instead of trusting the call's `convergent` attribute, so a convergent call to
+// a clean-bodied device function slips through eligibility.  Check the attribute
+// directly here (as LLVM's unroller does) so we never request a runtime unroll
+// that would abort.  Leaving containsConvergent()/the containsBarrier feature
+// untouched keeps the already-collected NVPTX dataset consistent.
+static bool loopCanRuntimeUnroll(const Loop &L) {
+  for (const BasicBlock *BB : L.blocks())
+    for (const Instruction &I : *BB)
+      if (const auto *CB = dyn_cast<CallBase>(&I))
+        if (CB->isConvergent())
+          return false;
+  return true;
+}
 
 static cl::opt<unsigned>
     uuUnrollFactor("uu-unrollfactor", cl::init(2),
@@ -727,7 +747,11 @@ PreservedAnalyses UnrollAndUnmergeFunctionPass::run(Function &F,
       UnrollLoopOptions ULO;
       ULO.Count                   = factor;
       ULO.Force                   = true;   // agent decided — bypass profitability
-      ULO.Runtime                 = true;   // GPU loops rarely have static trip counts
+      // GPU loops rarely have static trip counts, so request runtime unrolling —
+      // but NOT for a convergent loop, where LLVM can't build a remainder and
+      // would assert. With Runtime=false, UnrollLoop unrolls only on a known trip
+      // count (still valid), else no-ops — correct behaviour instead of a crash.
+      ULO.Runtime                 = loopCanRuntimeUnroll(L);
       ULO.AllowExpensiveTripCount = true;
       ULO.UnrollRemainder         = false;
       ULO.ForgetAllSCEV           = false;
