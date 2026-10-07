@@ -150,10 +150,16 @@ private:
   bool Verbose;
 
   bool allGenericLibsValid() const {
+    // DenormalsAreZero (oclc_daz_opt_*) and CorrectlyRoundedSqrt
+    // (oclc_correctly_rounded_sqrt_*) were REMOVED from AMD device-libs in newer
+    // ROCm (the ROCm-10 package used here ships neither), so they are OPTIONAL
+    // here: an older complete set still passes, and a newer reduced set is no
+    // longer wrongly rejected as "cannot find ROCm device library".  Their use
+    // in getCommonBitcodeLibs is guarded to match.  This mirrors ROCm's own
+    // clang, which links neither against this device-libs package.
     return !OCML.empty() && !OCKL.empty() && !OpenCL.empty() &&
            WavefrontSize64.isValid() && FiniteOnly.isValid() &&
-           UnsafeMath.isValid() && DenormalsAreZero.isValid() &&
-           CorrectlyRoundedSqrt.isValid();
+           UnsafeMath.isValid();
   }
 
   void scanLibDevicePath(llvm::StringRef Path);

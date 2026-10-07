@@ -969,10 +969,15 @@ RocmInstallationDetector::getCommonBitcodeLibs(
     AddBCLib(getOCKLPath());
   else if (GPUSan && isOpenMP)
     AddBCLib(getOCKLPath(), false);
-  AddBCLib(getDenormalsAreZeroPath(DAZ));
+  // DenormalsAreZero / CorrectlyRoundedSqrt are absent from newer AMD
+  // device-libs (ROCm-10 here); only link them when the package provides them,
+  // matching the relaxed allGenericLibsValid() check in ROCm.h.
+  if (DenormalsAreZero.isValid())
+    AddBCLib(getDenormalsAreZeroPath(DAZ));
   AddBCLib(getUnsafeMathPath(UnsafeMathOpt || FastRelaxedMath));
   AddBCLib(getFiniteOnlyPath(FiniteOnly || FastRelaxedMath));
-  AddBCLib(getCorrectlyRoundedSqrtPath(CorrectSqrt));
+  if (CorrectlyRoundedSqrt.isValid())
+    AddBCLib(getCorrectlyRoundedSqrtPath(CorrectSqrt));
   AddBCLib(getWavefrontSize64Path(Wave64));
   AddBCLib(LibDeviceFile);
   auto ABIVerPath = getABIVersionPath(ABIVer);
