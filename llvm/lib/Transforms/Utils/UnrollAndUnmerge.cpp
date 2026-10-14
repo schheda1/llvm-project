@@ -1,13 +1,17 @@
 #include "llvm/Transforms/Utils/UnrollAndUnmerge.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CommandLine.h"
@@ -89,6 +93,10 @@ struct UnmergeInfo {
   std::unordered_map<BasicBlock *, BasicBlock *> &clonedBB2BB;
   BasicBlock *firstClonedHeader;
   int unrollFactor;
+  // Headers of the natural loops nested in L, found by dominance before the
+  // walk (see unmerge()).  The DFS cuts inner cycles on these; it must not
+  // rely on LoopInfo for that (see dfsAndDuplicate).
+  const SmallPtrSetImpl<BasicBlock *> *innerHeaders;
 };
 
 PathInformation::PathInformation() {
@@ -260,19 +268,33 @@ static BasicBlock *dfsAndDuplicate(UnmergeInfo &unmergeInfo) {
   BasicBlock *BB = unmergeInfo.BB;
   PathInformation &pathInfo = *unmergeInfo.pathInfo;
 
-  // Check if it is a loop header of a child loop that we have already visited.
-  // If so, return the corresponding cloned header. This is only relevant for
-  // loops that contain child loops.
-  Loop *LoopForBB = unmergeInfo.LI.getLoopFor(BB);
-  if (LoopForBB) {
-    if (LoopForBB != &unmergeInfo.L) {
-      if (LoopForBB->getHeader() == BB) {
-        if (pathInfo.containsClonedBB(BB)) {
-          return pathInfo.getClonedBB(BB);
-        }
-      }
-    }
+  // Cut inner cycles: a nested loop's header reached a SECOND time on this
+  // path is the target of that loop's backedge, so link to the copy already
+  // made on this path instead of copying the body again.
+  //
+  // The headers come from the DOMINATOR TREE (a block that dominates one of
+  // its in-loop predecessors; computed once per unmerge in unmerge()), NOT
+  // from LoopInfo.  unmerge registers every cloned block under the ONE new
+  // loop (addClonedBlockToLoopInfo keys on the loop being unmerged), so after
+  // an inner unmerge its subloops no longer exist in LoopInfo while their
+  // cycles still exist in the CFG.  A LoopInfo-based test ("is BB the header
+  // of the loop LoopInfo says owns it") then never fired for such a flattened
+  // grandchild and the walk followed its backedge forever (observed as a
+  // non-terminating compile when unmerging above an unmerged loop that had
+  // children).  When LoopInfo is fresh the two tests agree exactly — LoopInfo
+  // defines a header by this same dominance test — so every single-transform
+  // compile is unchanged.  DT is current here: postProcessing recalculates it
+  // after every unmerge and UnrollLoop preserves it.
+  if (unmergeInfo.innerHeaders->count(BB) && pathInfo.containsClonedBB(BB)) {
+    return pathInfo.getClonedBB(BB);
   }
+#ifndef NDEBUG
+  // The dominance test must recognise every header LoopInfo still knows.
+  if (Loop *LoopForBB = unmergeInfo.LI.getLoopFor(BB))
+    if (LoopForBB != &unmergeInfo.L && LoopForBB->getHeader() == BB)
+      assert(unmergeInfo.innerHeaders->count(BB) &&
+             "LoopInfo header not recognised by the dominance header test");
+#endif
 
   bool isExitBlock = !unmergeInfo.L.contains(BB);
   if (isExitBlock) {
@@ -646,9 +668,26 @@ unmerge(Loop &L, LoopInfo &LI, DominatorTree &DT, ScalarEvolution &SE,
     newLoopsMap[ParentLoop] = ParentLoop;
   }
 
+  // Headers of the natural loops nested in L, by dominance: a block (other
+  // than L's own header) that dominates one of its predecessors inside L is
+  // the target of a backedge.  This is exactly how LoopInfo discovers loops,
+  // but it stays correct after an earlier unmerge flattened LoopInfo below L
+  // (see the cycle cut in dfsAndDuplicate).
+  SmallPtrSet<BasicBlock *, 8> innerHeaders;
+  for (BasicBlock *BB : L.blocks()) {
+    if (BB == header)
+      continue;
+    for (BasicBlock *Pred : predecessors(BB)) {
+      if (L.contains(Pred) && DT.dominates(BB, Pred)) {
+        innerHeaders.insert(BB);
+        break;
+      }
+    }
+  }
+
   UnmergeInfo unmergeInfo{
       header, startCutpoint, *F,      pathInfo,        newLoopsMap, LI, L,
-      DT,     clonedBB2BB,   nullptr, unrollFactor};
+      DT,     clonedBB2BB,   nullptr, unrollFactor,    &innerHeaders};
 
   BasicBlock *duplicatedHeader = dfsAndDuplicate(unmergeInfo);
 
@@ -705,6 +744,65 @@ Pass *llvm::createUnrollAndUnmergePass() { return new UnrollAndUnmerge(); }
 
 UnrollAndUnmergeFunctionPass::UnrollAndUnmergeFunctionPass() {}
 
+static cl::opt<bool> uuStampLoops(
+    "uu-stamp-loops", cl::init(true),
+    cl::desc("Before transforming, attach a 'uu.loop.idx' loop-metadata option "
+             "(the pre-transform loop index) to every terminator of each "
+             "loop's own blocks, so LoopCount can identify loops and their "
+             "clones afterwards (uuIdx column).  Metadata only; inert for "
+             "codegen.  Set to 0 to reproduce unstamped IR."));
+
+/// Stamp L with its pre-transform index so it can be found again after the
+/// transforms, including every clone of it.
+///
+/// Both the unmerge DFS and LLVM's unroller copy blocks with CloneBasicBlock,
+/// whose Instruction::clone copies metadata by pointer, so each clone of a
+/// block keeps its stamp.  The stamp is a standard !llvm.loop option node
+/// {"uu.loop.idx", i32 idx}.  It goes on the terminator of EVERY block whose
+/// innermost loop is L (not just the latch), so that no single terminator
+/// replacement — the unroller folding an exit branch, LoopSimplify merging
+/// latches into a new backedge block — can lose the identity; LoopCount takes
+/// the majority over a loop's own blocks.  LLVM interprets !llvm.loop only on
+/// latch terminators and only reads options it knows by name, so the extra
+/// placements and the unknown option are inert.  An existing loop ID (pragma
+/// hints) is preserved: its options are carried over and ours is appended.
+static void stampLoopIdx(Loop &L, int idx, LoopInfo &LI) {
+  LLVMContext &Ctx = L.getHeader()->getContext();
+  Metadata *OptOps[] = {
+      MDString::get(Ctx, "uu.loop.idx"),
+      ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(Ctx), idx))};
+  MDNode *Opt = MDNode::get(Ctx, OptOps);
+  // One distinct, self-referencing loop-ID node per loop, shared by all of its
+  // own blocks that had no loop ID.  A block that already carries one (pragma
+  // hints on the latch) gets a merged node instead: its options plus ours.
+  MDNode *Plain = nullptr;
+  for (BasicBlock *BB : L.blocks()) {
+    if (LI.getLoopFor(BB) != &L)
+      continue; // a subloop's block carries that subloop's stamp
+    Instruction *TI = BB->getTerminator();
+    if (!TI)
+      continue;
+    MDNode *ID = nullptr;
+    if (MDNode *Old = TI->getMetadata(LLVMContext::MD_loop)) {
+      SmallVector<Metadata *, 4> Ops;
+      Ops.push_back(nullptr); // self-reference, filled in below
+      for (unsigned I = 1, E = Old->getNumOperands(); I < E; ++I)
+        Ops.push_back(Old->getOperand(I));
+      Ops.push_back(Opt);
+      ID = MDNode::getDistinct(Ctx, Ops);
+      ID->replaceOperandWith(0, ID);
+    } else {
+      if (!Plain) {
+        Metadata *PlainOps[] = {nullptr, Opt};
+        Plain = MDNode::getDistinct(Ctx, PlainOps);
+        Plain->replaceOperandWith(0, Plain);
+      }
+      ID = Plain;
+    }
+    TI->setMetadata(LLVMContext::MD_loop, ID);
+  }
+}
+
 PreservedAnalyses UnrollAndUnmergeFunctionPass::run(Function &F,
                                              FunctionAnalysisManager &AM) {
   LLVM_DEBUG(dbgs() << "=== Start Unroll & Unmerge Function Pass ===\n");
@@ -726,6 +824,19 @@ PreservedAnalyses UnrollAndUnmergeFunctionPass::run(Function &F,
 
   SmallPriorityWorklist<Loop *, 4> Worklist;
   appendLoopsToWorklist(LI, Worklist);
+
+  if (uuStampLoops) {
+    // Same traversal as the dispatch loop below (and as LoopCount), so the
+    // k-th popped loop is stamped with exactly the index getLoopDispatch will
+    // assign it: seenLoops + k (every pop increments seenLoops once, matching
+    // or not).  Done BEFORE any transform, on fresh LoopInfo, so "own blocks"
+    // is exact.  seenLoops itself is untouched here.
+    SmallPriorityWorklist<Loop *, 4> StampList;
+    appendLoopsToWorklist(LI, StampList);
+    int idx = seenLoops;
+    while (!StampList.empty())
+      stampLoopIdx(*StampList.pop_back_val(), idx++, LI);
+  }
 
   while (!Worklist.empty()) {
     Loop &L = *Worklist.pop_back_val();

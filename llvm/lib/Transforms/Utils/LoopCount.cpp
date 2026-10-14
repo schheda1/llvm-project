@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Utils/LoopCount.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PriorityWorklist.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -390,7 +391,14 @@ void printColumnHeader(int seenLoops, Module *M) {
            << "containsCall;"
            << "numExits;"
            << "isKernelFunction;"
-           << "kernelParents";
+           << "kernelParents;"
+           // Pre-transform loop identity stamped by the UU pass (uu-stamp-loops):
+           // -1 when unstamped (plain --enable-loopcount compiles).  Metadata,
+           // not an ML feature.  Placed before the embedding blocks on purpose:
+           // the Python parser reads the CSV by header name, and the feature
+           // schema (features.py) never lists these two.
+           << "uuIdx;"
+           << "uuIdxMixed";
     // IR2Vec loop-content embedding columns, appended at the END so the
     // structural feature positions (and the RL trip-count mask indices) never
     // move.  See design decision 2 in ir2vec_plan.md.
@@ -693,6 +701,51 @@ static void stampLoopInstructions(Loop &L, int loopIdx) {
   }
 }
 
+/// Read back the UU pass's pre-transform identity stamp (uu-stamp-loops): the
+/// "uu.loop.idx" option in the !llvm.loop metadata of L's OWN blocks' terminators
+/// (blocks whose innermost loop is L — a subloop's blocks carry the subloop's
+/// stamp).  The stamp is on every own-block terminator, so a single replaced
+/// terminator cannot lose it; the majority wins.  Returns {idx, mixed}: idx = -1
+/// when no block is stamped, mixed = true when the own blocks disagree (a loop
+/// fused from differently-stamped blocks — never produced by unmerge/unroll).
+/// LoopInfo here is fresh (recomputed after the transform), so clones of a
+/// subloop are rediscovered as subloops and excluded from the parent's vote.
+static std::pair<int, bool> readUUIdx(const Loop &L, const LoopInfo &LI) {
+  DenseMap<int, unsigned> Votes;
+  for (const BasicBlock *BB : L.blocks()) {
+    if (LI.getLoopFor(BB) != &L)
+      continue;
+    const Instruction *TI = BB->getTerminator();
+    if (!TI)
+      continue;
+    const MDNode *ID = TI->getMetadata(LLVMContext::MD_loop);
+    if (!ID)
+      continue;
+    // Operand 0 of a loop ID is its self-reference; options follow.
+    for (unsigned I = 1, E = ID->getNumOperands(); I < E; ++I) {
+      const auto *Opt = dyn_cast_or_null<MDNode>(ID->getOperand(I));
+      if (!Opt || Opt->getNumOperands() != 2)
+        continue;
+      const auto *Name = dyn_cast_or_null<MDString>(Opt->getOperand(0));
+      if (!Name || Name->getString() != "uu.loop.idx")
+        continue;
+      if (const auto *C =
+              mdconst::dyn_extract_or_null<ConstantInt>(Opt->getOperand(1)))
+        ++Votes[static_cast<int>(C->getSExtValue())];
+    }
+  }
+  if (Votes.empty())
+    return {-1, false};
+  int Best = -1;
+  unsigned BestN = 0;
+  for (const auto &KV : Votes)
+    if (KV.second > BestN) {
+      Best = KV.first;
+      BestN = KV.second;
+    }
+  return {Best, Votes.size() > 1};
+}
+
 static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
                           TargetTransformInfo &TTI, int &seenLoops,
                           LoopInfo &LI, ScalarEvolution &SE,
@@ -724,6 +777,8 @@ static void printLoopData(Loop &L, Module *M, Function *F, AssumptionCache &AC,
   printNumExits(L);
   errs() << ";" << (isGPUKernel(F) ? 1 : 0);
   errs() << ";" << getKernelParents(F);
+  const std::pair<int, bool> UU = readUUIdx(L, LI);
+  errs() << ";" << UU.first << ";" << (UU.second ? 1 : 0);
   printLoopEmbedding(L, Emb);
   if (EmitFAEmbedding)
     printLoopFAEmbedding(L, FAMap);
