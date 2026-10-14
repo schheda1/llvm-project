@@ -745,12 +745,15 @@ Pass *llvm::createUnrollAndUnmergePass() { return new UnrollAndUnmerge(); }
 UnrollAndUnmergeFunctionPass::UnrollAndUnmergeFunctionPass() {}
 
 static cl::opt<bool> uuStampLoops(
-    "uu-stamp-loops", cl::init(true),
+    "uu-stamp-loops", cl::init(false),
     cl::desc("Before transforming, attach a 'uu.loop.idx' loop-metadata option "
              "(the pre-transform loop index) to every terminator of each "
              "loop's own blocks, so LoopCount can identify loops and their "
-             "clones afterwards (uuIdx column).  Metadata only; inert for "
-             "codegen.  Set to 0 to reproduce unstamped IR."));
+             "clones afterwards (uuIdx column).  OFF by default: a compile "
+             "whose binary is measured must stay byte-identical to the "
+             "unstamped pipeline (the stamp was observed to perturb PTX).  "
+             "Turn on only for post-transform feature re-extraction compiles, "
+             "which are never executed."));
 
 /// Stamp L with its pre-transform index so it can be found again after the
 /// transforms, including every clone of it.
