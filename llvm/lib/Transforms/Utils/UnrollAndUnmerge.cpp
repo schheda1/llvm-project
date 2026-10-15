@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Utils/UnrollAndUnmerge.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -150,6 +151,27 @@ bool PathInformation::containsClonedBB(BasicBlock *bb) {
 
 ValueToValueMapTy *PathInformation::getVmap() { return vmap; }
 
+// NOTE (known limitation, deliberately left as is): every cloned block is
+// registered under the ONE new loop for the loop being unmerged, keyed on
+// unmergeInfo.L rather than on LI->getLoopFor(OriginalBB) (the commented-out
+// line below, which is what LLVM's unroller does).  So after unmerge the
+// subloops of the transformed loop no longer exist in LoopInfo: their cycles
+// are still in the CFG, but LoopInfo shows them flattened into the new loop,
+// and each path's copy of a subloop does not own a Loop object.  This is
+// harmless today: the pass returns PreservedAnalyses::none() whenever it
+// changes anything, so the stale LoopInfo never leaves the pass; LoopCount
+// recomputes LoopInfo and rediscovers the clones as real subloops; the only
+// in-pass consumer that needed subloop headers (the DFS cycle cut) was moved
+// to the dominator tree for exactly this reason; and LLVM's unroller, when it
+// runs later on an ancestor, merely registers its clones under whatever loop
+// LoopInfo reports.  It becomes necessary to fix if any future in-pass step
+// needs correct nesting below an unmerged loop (per-subloop
+// re-canonicalisation, trip counts via SCEV on the clones, or an unroller
+// that asserts LoopInfo consistency).  The idiomatic fix is the unroller's
+// scheme — key NewLoops on getLoopFor(OriginalBB) and allocate a Loop per
+// cloned subloop — but it needs PER-PATH bookkeeping here, because every
+// path of the DFS makes its own copy of a subloop and each copy is a separate
+// loop; NewLoops is currently shared across paths.
 static const Loop *addClonedBlockToLoopInfo(UnmergeInfo &unmergeInfo,
                                             BasicBlock *ClonedBB) {
   BasicBlock *OriginalBB = unmergeInfo.BB;
@@ -745,65 +767,43 @@ Pass *llvm::createUnrollAndUnmergePass() { return new UnrollAndUnmerge(); }
 UnrollAndUnmergeFunctionPass::UnrollAndUnmergeFunctionPass() {}
 
 static cl::opt<bool> uuStampLoops(
-    "uu-stamp-loops", cl::init(false),
-    cl::desc("Before transforming, attach a 'uu.loop.idx' loop-metadata option "
-             "(the pre-transform loop index) to every terminator of each "
-             "loop's own blocks, so LoopCount can identify loops and their "
-             "clones afterwards (uuIdx column).  OFF by default: a compile "
-             "whose binary is measured must stay byte-identical to the "
-             "unstamped pipeline (the stamp was observed to perturb PTX).  "
-             "Turn on only for post-transform feature re-extraction compiles, "
-             "which are never executed."));
+    "uu-stamp-loops", cl::init(false), cl::Hidden,
+    cl::desc("Before transforming, record each loop's pre-transform index as "
+             "a 'uu.loop.idx' option in its loop ID (!llvm.loop on the latch) "
+             "so LoopCount can identify loops and their clones afterwards "
+             "(uuIdx column).  Off by default: loop metadata changes codegen "
+             "(SimplifyCFG keeps an empty block whose branch and predecessor "
+             "both carry !llvm.loop), so a compile whose binary is measured "
+             "must stay unstamped.  Turn on only for post-transform feature "
+             "re-extraction compiles, which are never executed."));
 
-/// Stamp L with its pre-transform index so it can be found again after the
-/// transforms, including every clone of it.
+/// Record L's pre-transform index as a loop-ID option so L, and every clone
+/// of it, can be identified after the transforms.
 ///
-/// Both the unmerge DFS and LLVM's unroller copy blocks with CloneBasicBlock,
-/// whose Instruction::clone copies metadata by pointer, so each clone of a
-/// block keeps its stamp.  The stamp is a standard !llvm.loop option node
-/// {"uu.loop.idx", i32 idx}.  It goes on the terminator of EVERY block whose
-/// innermost loop is L (not just the latch), so that no single terminator
-/// replacement — the unroller folding an exit branch, LoopSimplify merging
-/// latches into a new backedge block — can lose the identity; LoopCount takes
-/// the majority over a loop's own blocks.  LLVM interprets !llvm.loop only on
-/// latch terminators and only reads options it knows by name, so the extra
-/// placements and the unknown option are inert.  An existing loop ID (pragma
-/// hints) is preserved: its options are carried over and ours is appended.
-static void stampLoopIdx(Loop &L, int idx, LoopInfo &LI) {
+/// Placement follows LangRef (llvm.loop): the ID is a distinct node whose
+/// first operand is itself, attached to the latch terminator via setLoopID.
+/// Options of an existing ID (pragma hints) are carried over, as
+/// makePostTransformationMetadata does.  Persistence needs nothing beyond
+/// what LLVM already guarantees for latch metadata: CloneBasicBlock copies
+/// it, so each clone's latch keeps it; LoopSimplify, SplitBlockPredecessors
+/// and BreakCriticalEdges move it to a new latch; LoopPeel strips it from a
+/// peeled copy, which is no longer a loop.  Not inert for codegen (see the
+/// option description), hence opt-in.
+static void stampLoopIdx(Loop &L, int idx) {
   LLVMContext &Ctx = L.getHeader()->getContext();
   Metadata *OptOps[] = {
       MDString::get(Ctx, "uu.loop.idx"),
       ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(Ctx), idx))};
   MDNode *Opt = MDNode::get(Ctx, OptOps);
-  // One distinct, self-referencing loop-ID node per loop, shared by all of its
-  // own blocks that had no loop ID.  A block that already carries one (pragma
-  // hints on the latch) gets a merged node instead: its options plus ours.
-  MDNode *Plain = nullptr;
-  for (BasicBlock *BB : L.blocks()) {
-    if (LI.getLoopFor(BB) != &L)
-      continue; // a subloop's block carries that subloop's stamp
-    Instruction *TI = BB->getTerminator();
-    if (!TI)
-      continue;
-    MDNode *ID = nullptr;
-    if (MDNode *Old = TI->getMetadata(LLVMContext::MD_loop)) {
-      SmallVector<Metadata *, 4> Ops;
-      Ops.push_back(nullptr); // self-reference, filled in below
-      for (unsigned I = 1, E = Old->getNumOperands(); I < E; ++I)
-        Ops.push_back(Old->getOperand(I));
-      Ops.push_back(Opt);
-      ID = MDNode::getDistinct(Ctx, Ops);
-      ID->replaceOperandWith(0, ID);
-    } else {
-      if (!Plain) {
-        Metadata *PlainOps[] = {nullptr, Opt};
-        Plain = MDNode::getDistinct(Ctx, PlainOps);
-        Plain->replaceOperandWith(0, Plain);
-      }
-      ID = Plain;
-    }
-    TI->setMetadata(LLVMContext::MD_loop, ID);
-  }
+  SmallVector<Metadata *, 4> Ops;
+  Ops.push_back(nullptr); // self-reference, filled in below
+  if (MDNode *Old = L.getLoopID())
+    for (const MDOperand &MDO : llvm::drop_begin(Old->operands()))
+      Ops.push_back(MDO.get());
+  Ops.push_back(Opt);
+  MDNode *ID = MDNode::getDistinct(Ctx, Ops);
+  ID->replaceOperandWith(0, ID);
+  L.setLoopID(ID);
 }
 
 PreservedAnalyses UnrollAndUnmergeFunctionPass::run(Function &F,
@@ -832,13 +832,13 @@ PreservedAnalyses UnrollAndUnmergeFunctionPass::run(Function &F,
     // Same traversal as the dispatch loop below (and as LoopCount), so the
     // k-th popped loop is stamped with exactly the index getLoopDispatch will
     // assign it: seenLoops + k (every pop increments seenLoops once, matching
-    // or not).  Done BEFORE any transform, on fresh LoopInfo, so "own blocks"
-    // is exact.  seenLoops itself is untouched here.
+    // or not).  Done BEFORE any transform, so every loop still has its own
+    // latch and LoopInfo is fresh.  seenLoops itself is untouched here.
     SmallPriorityWorklist<Loop *, 4> StampList;
     appendLoopsToWorklist(LI, StampList);
     int idx = seenLoops;
     while (!StampList.empty())
-      stampLoopIdx(*StampList.pop_back_val(), idx++, LI);
+      stampLoopIdx(*StampList.pop_back_val(), idx++);
   }
 
   while (!Worklist.empty()) {
