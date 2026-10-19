@@ -32,7 +32,9 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/PGOOptions.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
@@ -208,8 +210,14 @@ static cl::opt<std::string> LoopCountEmitIR(
     cl::desc("If non-empty, write the module to this path right after LoopCount "
              "runs — the early, stamped IR (see -loopcount-stamp-loops) a graph "
              "builder consumes, aligned with the CSV loopIdx and NOT the "
-             "fully-optimized IR. Use with --cuda-device-only so a single cc1 "
-             "writes one file."));
+             "fully-optimized IR.  A path ending in '/' (or an existing "
+             "directory) selects PER-MODULE files inside it, named "
+             "<source basename>.<target triple>.ll, so a full build — host and "
+             "device cc1s, several translation units, several program variants "
+             "— cannot overwrite one another (the last compile of a given file "
+             "and triple wins, exactly as the CSV parser keeps the last block).  "
+             "A plain file path writes one file: use it only with "
+             "--cuda-device-only, where a single cc1 runs."));
 static cl::opt<bool>
     EnableForceUnroll("enable-unroll", cl::init(false),
                       cl::desc("Force enables LoopUnrollPass."));
@@ -2407,7 +2415,17 @@ namespace {
 // describe — before the rest of the -O3 pipeline mutates loops/instructions.
 struct LoopCountEmitIRPass : PassInfoMixin<LoopCountEmitIRPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
-    const std::string Path = LoopCountEmitIR;
+    std::string Path = LoopCountEmitIR;
+    if (!Path.empty() && (Path.back() == '/' || sys::fs::is_directory(Path))) {
+      // Per-module mode: <dir>/<source basename>.<triple>.ll.  The basename
+      // is what the CSV METADATA line reports as the module's filename (up to
+      // a directory prefix the caller strips the same way); the triple keeps
+      // the host and device modules of one source apart.
+      SmallString<512> P(Path);
+      sys::path::append(P, sys::path::filename(M.getSourceFileName()) + "." +
+                               M.getTargetTriple().str() + ".ll");
+      Path = std::string(P);
+    }
     if (!Path.empty()) {
       std::error_code EC;
       raw_fd_ostream OS(Path, EC, sys::fs::OF_Text);
