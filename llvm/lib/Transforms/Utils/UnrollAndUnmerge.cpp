@@ -16,6 +16,8 @@
 #include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -82,6 +84,54 @@ static cl::list<int> optLoopUnmerge(
              "matched to uu-opt-loop-idx."),
     cl::CommaSeparated);
 
+// Size budgets.  The heuristic path never unmerges a loop whose projected size
+// exceeds 1024 instructions (canUnrollAndUnmerge); the RL dispatch path takes
+// the requested factor as given, and the path DFS clones about
+// loopSize * sum_{i<factor} numPaths^i instructions (16 paths at factor 10 is
+// ~7e10 bodies).  Such compiles ran for days at TB-scale RSS until the harness
+// killed them at its timeout.  Both budgets turn that into a compile failure
+// within seconds whose message starts with "UU budget", which the harness maps
+// to the compile-timeout class (store_common.classify_compile_error).
+//
+// The projection is in practice a lower bound on what the DFS clones (each
+// header copy re-clones the whole body, and inner loops multiply the paths;
+// measured cloned/projected 1.0 .. 1500, median 2, over 1,223 HeCBench cells,
+// the high end for loops with inner loops).  Defaults: projected 1e7 — on the
+// 8,100-cell run_sweep_3 cache, unmerge cells projected above it failed 98% of
+// the time and none had a positive reward; cloned 3e7 (~10 GB in the pass) —
+// above every compilable cell that passes the projection check (largest seen
+// 2.1e7), so the clone budget only stops runaway nests.  Neither bounds the
+// later passes; the harness timeout does.
+static cl::opt<unsigned long long> uuMaxEstimatedSize(
+    "uu-max-estimated-size", cl::init(10000000),
+    cl::desc("RL dispatch only: fail the compile before unmerging a loop whose "
+             "projected size loopSize * sum_{i<factor} numPaths^i exceeds "
+             "this many instructions. 0 disables."));
+
+static cl::opt<unsigned long long> uuMaxClonedInsts(
+    "uu-max-cloned-insts", cl::init(30000000),
+    cl::desc("Fail the compile once one unmerge has cloned more than this many "
+             "instructions. Catches nests the projected size under-counts "
+             "(the DFS walks inner loop bodies path by path). 0 disables."));
+
+static cl::opt<bool> uuReportSize(
+    "uu-report-size", cl::init(false), cl::Hidden,
+    cl::desc("Print one 'UU-SIZE;' line per RL-dispatched unmerge to stderr: "
+             "function, loop index, factor, numPaths, loopSize, projected "
+             "size and the number of instructions actually cloned."));
+
+/// loopSize * sum_{i<factor} numPaths^i, the getEstimatedLoopSize model,
+/// saturating at UINT64_MAX instead of overflowing through pow().
+static uint64_t projectedUnmergeSize(uint64_t loopSize, uint64_t numPaths,
+                                     unsigned factor) {
+  uint64_t sum = 0, term = 1; // term = numPaths^i
+  for (unsigned i = 0; i < factor; ++i) {
+    sum = SaturatingAdd(sum, term);
+    term = SaturatingMultiply(term, numPaths);
+  }
+  return SaturatingMultiply(sum, loopSize);
+}
+
 struct UnmergeInfo {
   BasicBlock *BB;
   BasicBlock *startCutpoint;
@@ -98,6 +148,9 @@ struct UnmergeInfo {
   // walk (see unmerge()).  The DFS cuts inner cycles on these; it must not
   // rely on LoopInfo for that (see dfsAndDuplicate).
   const SmallPtrSetImpl<BasicBlock *> *innerHeaders;
+  // Instructions cloned so far by this unmerge, shared by every copy of this
+  // struct (checked against uu-max-cloned-insts in duplicateBB).
+  uint64_t &clonedInsts;
 };
 
 PathInformation::PathInformation() {
@@ -223,6 +276,17 @@ BasicBlock *duplicateBB(UnmergeInfo &unmergeInfo) {
   pathInfo.setClonedBB(unmergeInfo.BB, clonedBB);
   unmergeInfo.clonedBB2BB[clonedBB] = unmergeInfo.BB;
 
+  unmergeInfo.clonedInsts += clonedBB->size();
+  if (uuMaxClonedInsts && unmergeInfo.clonedInsts > uuMaxClonedInsts)
+    report_fatal_error(Twine("UU budget: unmerge of loop '") +
+                           unmergeInfo.L.getHeader()->getName() + "' in '" +
+                           unmergeInfo.F.getName() + "' (factor " +
+                           Twine(unmergeInfo.unrollFactor) + ") cloned " +
+                           Twine(unmergeInfo.clonedInsts) +
+                           " instructions > uu-max-cloned-insts=" +
+                           Twine((uint64_t)uuMaxClonedInsts),
+                       /*gen_crash_diag=*/false);
+
   return clonedBB;
 }
 
@@ -273,11 +337,16 @@ static void handleTerminator(UnmergeInfo &unmergeInfo, BasicBlock &copyBB) {
       // instructions. We need to create a new PathInformation for each
       // successor BB because the instruction map is modified while visiting the
       // successors. I am pretty sure this is expensive and can be done better.
-
-      PathInformation *newPathInfo = new PathInformation(*pathInfo);
+      //
+      // The copy is only read inside its own subtree, so it is freed as soon
+      // as the recursive call returns (addIncomingValuesToPhi below reads the
+      // PARENT's map).  It used to be leaked: one full value map per cloned
+      // branch, each entry a value handle registered on a live value, which
+      // grew peak RSS with the number of paths and slowed every later RAUW.
+      auto newPathInfo = std::make_unique<PathInformation>(*pathInfo);
       UnmergeInfo unmergeInfoCopy = unmergeInfo;
       unmergeInfoCopy.BB = succBB;
-      unmergeInfoCopy.pathInfo = newPathInfo;
+      unmergeInfoCopy.pathInfo = newPathInfo.get();
       newSuccessorBB = dfsAndDuplicate(unmergeInfoCopy);
     }
 
@@ -655,7 +724,8 @@ static Loop *addClonedLoopToLoopInfo(Loop *L, Loop *PL, ValueToValueMapTy &VM,
 static std::pair<bool, Loop *>
 unmerge(Loop &L, LoopInfo &LI, DominatorTree &DT, ScalarEvolution &SE,
         TargetTransformInfo &TTI, AssumptionCache &AC, LPMUpdater *U,
-        bool checkSkip = true, int unrollFactor = -1) {
+        bool checkSkip = true, int unrollFactor = -1,
+        uint64_t *ClonedInstsOut = nullptr) {
   if (unrollFactor == -1) {
     unrollFactor = uuUnrollFactor;
   }
@@ -664,11 +734,17 @@ unmerge(Loop &L, LoopInfo &LI, DominatorTree &DT, ScalarEvolution &SE,
     return std::make_pair(false, nullptr);
   }
 
-  assert(L.isLoopSimplifyForm() && "Expected loop to already be in simplify "
-                                   "form when starting unmerge pass.");
-  assert(
-      L.isLCSSAForm(DT) &&
-      "Expected loop to already be in LCSSA form when starting unmerge pass.");
+  // Preconditions of the DFS, checked in every build: these were asserts, so a
+  // release (NDEBUG) compiler would have unmerged a malformed loop instead of
+  // failing the compile like the assertions build does.
+  if (!L.isLoopSimplifyForm())
+    report_fatal_error("UU: expected loop to already be in simplify form "
+                       "when starting unmerge pass",
+                       /*gen_crash_diag=*/false);
+  if (!L.isLCSSAForm(DT))
+    report_fatal_error("UU: expected loop to already be in LCSSA form when "
+                       "starting unmerge pass",
+                       /*gen_crash_diag=*/false);
 
   std::unordered_map<BasicBlock *, BasicBlock *> clonedBB2BB;
 
@@ -682,7 +758,7 @@ unmerge(Loop &L, LoopInfo &LI, DominatorTree &DT, ScalarEvolution &SE,
   }
 
   BasicBlock *startCutpoint = header;
-  PathInformation *pathInfo = new PathInformation();
+  PathInformation pathInfo;
 
   Loop *ParentLoop = L.getParentLoop();
   NewLoopsMap newLoopsMap;
@@ -707,11 +783,16 @@ unmerge(Loop &L, LoopInfo &LI, DominatorTree &DT, ScalarEvolution &SE,
     }
   }
 
-  UnmergeInfo unmergeInfo{
-      header, startCutpoint, *F,      pathInfo,        newLoopsMap, LI, L,
-      DT,     clonedBB2BB,   nullptr, unrollFactor,    &innerHeaders};
+  uint64_t clonedInsts = 0;
+  UnmergeInfo unmergeInfo{header,        startCutpoint, *F,
+                          &pathInfo,     newLoopsMap,   LI,
+                          L,             DT,            clonedBB2BB,
+                          nullptr,       unrollFactor,  &innerHeaders,
+                          clonedInsts};
 
   BasicBlock *duplicatedHeader = dfsAndDuplicate(unmergeInfo);
+  if (ClonedInstsOut)
+    *ClonedInstsOut = clonedInsts;
 
   Loop *uuLoop = newLoopsMap[&L];
   rewireEdges(header, duplicatedHeader);
@@ -848,11 +929,38 @@ PreservedAnalyses UnrollAndUnmergeFunctionPass::run(Function &F,
       continue;
 
     if (doUnmerge) {
-      // Full UU path: path-unmerge + custom unroll (original behaviour).
+      // Full UU path: path-unmerge + custom unroll (original behaviour), behind
+      // the static size budget (uu-max-estimated-size).  numPaths is -1 when
+      // the loop has no unique latch: no estimate, the clone budget still
+      // applies.
+      long long numPaths = -1;
+      int64_t loopSize = 0;
+      uint64_t projected = 0;
+      if (uuMaxEstimatedSize || uuReportSize) {
+        numPaths = getNumPaths(L, LI);
+        InstructionCost NumInsts = getLoopMetrics(L, AC, TTI).NumInsts;
+        loopSize = NumInsts.isValid() ? NumInsts.getValue() : 0;
+        if (numPaths > 0 && loopSize > 0)
+          projected = projectedUnmergeSize(loopSize, numPaths, factor);
+      }
+      if (uuMaxEstimatedSize && projected > uuMaxEstimatedSize)
+        report_fatal_error(
+            Twine("UU budget: loop ") + Twine(seenLoops - 1) + " in '" +
+                F.getName() + "' projected unmerge size " + Twine(projected) +
+                " > uu-max-estimated-size=" +
+                Twine((uint64_t)uuMaxEstimatedSize) + " (loopSize " +
+                Twine(loopSize) + ", numPaths " + Twine(numPaths) +
+                ", factor " + Twine(factor) + ")",
+            /*gen_crash_diag=*/false);
+      uint64_t cloned = 0;
       std::pair<bool, Loop *> result =
           unmerge(L, LI, DT, SE, TTI, AC, nullptr, /*checkSkip=*/false,
-                  (int)factor);
+                  (int)factor, &cloned);
       changed |= result.first;
+      if (uuReportSize)
+        errs() << "UU-SIZE;" << F.getName() << ";" << (seenLoops - 1) << ";"
+               << factor << ";" << numPaths << ";" << loopSize << ";"
+               << projected << ";" << cloned << "\n";
     } else if (factor > 1) {
       // Unroll-only path: bypass path-unmerging, use LLVM's standard unroller.
       // Correct action for RL agent decisions where doUnmerge=0 && factor>1.

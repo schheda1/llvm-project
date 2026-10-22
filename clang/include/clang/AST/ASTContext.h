@@ -1285,8 +1285,11 @@ public:
   /// Keep track of CUDA/HIP device-side variables ODR-used by host code.
   /// This does not include extern shared variables used by device host
   /// functions as addresses of shared variables are per warp, therefore
-  /// cannot be accessed by host code.
-  llvm::DenseSet<const VarDecl *> CUDADeviceVarODRUsedByHost;
+  /// cannot be accessed by host code.  SetVector is used to maintain the
+  /// order: device-side CodeGen emits these variables in iteration order, so a
+  /// DenseSet made the device module's global order, and with it the device
+  /// memory layout, depend on heap addresses (e.g. on the source path length).
+  llvm::SetVector<const VarDecl *> CUDADeviceVarODRUsedByHost;
 
   /// Keep track of CUDA/HIP external kernels or device variables ODR-used by
   /// host code. SetVector is used to maintain the order.
